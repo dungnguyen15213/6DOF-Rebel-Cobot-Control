@@ -19,6 +19,7 @@ from core.digital_twin_analytics import (
     AdaptiveBaselineRLS, CUSUMDetector, PayloadEstimator, TelemetryLogger, TelemetryRecord,
 )
 from core.latency_tracking import ExecutionLatencyTracker
+from core.latency_experiment_logger import LatencyExperimentLogger
 from hardware.robot_manager import RebelManager
 from settings import get_settings, save_settings, FFRLSSettings, CUSUMSettings, PayloadSettings
 
@@ -95,9 +96,9 @@ class MainWindow(QMainWindow):
         self.manager = RebelManager()
         self.kinematics = ReBelKinematics()
         self.execution_latency = ExecutionLatencyTracker()
+        self.latency_experiment_logger = LatencyExperimentLogger("latency_experiments.csv")
         self._motion_request_lock = threading.RLock()
         self._pending_motion_request = None
-        self._latest_motion_response = None
         self._init_digital_twin_analytics()
         self.realtime_data_log = []
         self.log_start_time = time.perf_counter()
@@ -757,12 +758,20 @@ class MainWindow(QMainWindow):
                 "target_velocity_deg_s": None,
                 "kind": "ALIVEJOG",
             }
+            self._pending_motion_request["trial_id"] = self.execution_latency.arm_trial(
+                t_gui=self._pending_motion_request["t_gui"],
+                joint_index=joint_index,
+                direction=speed,
+                commanded_speed=speed,
+                command_type="ALIVEJOG",
+            )
         self.manager.start_jog(axis, speed)
 
     def stop_jog_with_realtime(self):
         with self._motion_request_lock:
             self._pending_motion_request = None
         self.execution_latency.cancel_pending()
+        self._flush_completed_latency_trials()
         self.manager.stop_jog()
 
     def _reset_trails(self):
@@ -1086,22 +1095,23 @@ class MainWindow(QMainWindow):
         """Feeds the latest joint telemetry through FF-RLS -> CUSUM ->
         payload estimation for every joint and refreshes the Analytics tab.
 
-        The local timing in this method measures analytics processing only.
-        Network RTT and telemetry-observed motion response are tracked at the
-        CRI socket and STATUS receive boundaries.
+        The local timing in this method measures total analytics processing
+        for one complete cycle only. Network RTT and telemetry-observed motion
+        response are tracked separately at the CRI socket and STATUS receive
+        boundaries.
         """
-        processing_started = time.perf_counter()
-        t_gui = processing_started
+        processing_start = time.perf_counter()
+        analytics_time = processing_start
 
         if self._analytics_prev_time is not None:
-            dt = max(t_gui - self._analytics_prev_time, 1e-3)
+            dt = max(analytics_time - self._analytics_prev_time, 1e-3)
             q_dot_list = [
                 (real_joints[i] - self._analytics_prev_joints[i]) / dt for i in range(6)
             ]
         else:
             q_dot_list = [0.0] * 6
         self._analytics_prev_joints = list(real_joints)
-        self._analytics_prev_time = t_gui
+        self._analytics_prev_time = analytics_time
 
         log_requested = self.analytics_panel.chk_log_csv.isChecked()
         if log_requested and self.telemetry_logger is None:
@@ -1111,6 +1121,7 @@ class MainWindow(QMainWindow):
             self.telemetry_logger = None
 
         selected = self.analytics_panel.selected_joint
+        selected_status = None
         for i in range(6):
             # Static-gravity torque proxy: sin(theta) approximates the
             # joint-angle-dependent gravity load in absence of a full
@@ -1122,22 +1133,19 @@ class MainWindow(QMainWindow):
             collision_detected, cusum_score = self.cusum_detectors[i].update(residual)
             mass_g, payload_status = self.payload_estimators[i].update(theta_hat)
 
-            record_time = t_gui - self.log_start_time
+            record_time = analytics_time - self.log_start_time
             self.analytics_panel.add_sample(i, record_time, real_currents[i], y_hat, residual)
 
             if i == selected:
-                self.analytics_panel.update_status(
-                    cusum_score, collision_detected, mass_g, payload_status,
-                    (time.perf_counter() - processing_started) * 1000.0,
-                )
+                selected_status = (cusum_score, collision_detected, mass_g, payload_status)
 
             if self.telemetry_logger is not None:
-                with self._motion_request_lock:
-                    motion_response = self._latest_motion_response
+                snapshot = self.execution_latency.snapshot
+                motion_response = snapshot.response if snapshot else None
                 self.telemetry_logger.log(TelemetryRecord(
-                    t_gui=t_gui,
-                    t_virtual=t_gui,
-                    t_physical=t_gui,
+                    t_gui=analytics_time,
+                    t_virtual=analytics_time,
+                    t_physical=analytics_time,
                     sync_delay_s=0.0,
                     joint_id=f"J{i+1}",
                     raw_current=real_currents[i],
@@ -1146,7 +1154,7 @@ class MainWindow(QMainWindow):
                     collision_detected=collision_detected,
                     estimated_mass_g=mass_g,
                     payload_status=payload_status,
-                    timestamp=t_gui,
+                    timestamp=analytics_time,
                     cri_rtt_ms=self.manager.robot.network_latency.statistics.latest_ms,
                     estimated_one_way_ms=self.manager.robot.network_latency.estimated_one_way_ms,
                     rtt_jitter_ms=self.manager.robot.network_latency.statistics.peak_consecutive_jitter_ms,
@@ -1156,6 +1164,9 @@ class MainWindow(QMainWindow):
                     rtt_p99_ms=self.manager.robot.network_latency.statistics.p99_ms,
                     command_id=motion_response.command_id if motion_response else None,
                     joint_index=motion_response.joint_index if motion_response else None,
+                    gui_to_tx_ms=(
+                        snapshot.gui_to_tx_ms if snapshot else None
+                    ),
                     gui_to_motion_ms=(
                         motion_response.gui_to_motion_ms if motion_response else None
                     ),
@@ -1163,9 +1174,14 @@ class MainWindow(QMainWindow):
                         motion_response.tx_to_motion_ms if motion_response else None
                     ),
                 ))
-        # Legacy metric: elapsed local processing time inside one GUI analytics
-        # update. This is NOT CRI network RTT and NOT physical execution latency.
-        return (time.perf_counter() - processing_started) * 1000.0
+
+        processing_end = time.perf_counter()
+        analytics_processing_ms = (processing_end - processing_start) * 1000.0
+        if selected_status is not None:
+            self.analytics_panel.update_status(*selected_status, analytics_processing_ms)
+        # Total local analytics processing duration for this GUI analytics cycle.
+        # This is not CRI communication latency and not physical robot response latency.
+        return analytics_processing_ms
 
     def connect_robot(self):
         if self.manager.connect(self.ip_input.text().strip()):
@@ -1196,6 +1212,7 @@ class MainWindow(QMainWindow):
 
     def disconnect_robot(self):
         self.execution_latency.cancel_pending()
+        self._flush_completed_latency_trials()
         self.manager.disconnect()
         self._reset_trails()
         self._reset_execution_metrics()
@@ -1214,20 +1231,35 @@ class MainWindow(QMainWindow):
         self.lbl_total_current.setText("Total Joint Current: -- mA")
         self.lbl_power.setText("Power: -- W")
 
+    def closeEvent(self, event):
+        self.execution_latency.cancel_pending()
+        self._flush_completed_latency_trials()
+        self.manager.disconnect()
+        if self.telemetry_logger is not None:
+            self.telemetry_logger.close()
+            self.telemetry_logger = None
+        self.latency_experiment_logger.close()
+        super().closeEvent(event)
+
+    def _flush_completed_latency_trials(self):
+        """Writes each newly completed trial once from the GUI thread."""
+        network = self.manager.robot.network_latency
+        for trial in self.execution_latency.drain_completed_trials():
+            self.latency_experiment_logger.log_trial(
+                trial,
+                cri_rtt_ms=network.statistics.latest_ms,
+                estimated_one_way_ms=network.estimated_one_way_ms,
+                rtt_jitter_ms=network.statistics.peak_consecutive_jitter_ms,
+            )
+
     def _on_command_sent(self, command_id, command, t_tx):
         with self._motion_request_lock:
             request = self._pending_motion_request
             if request is None or not self._matches_motion_request(command, request):
                 return
             self._pending_motion_request = None
-        self.execution_latency.start_command(
-            command_id,
-            t_gui=request["t_gui"],
-            t_tx=t_tx,
-            joint_index=request["joint_index"],
-            direction=request["direction"],
-            commanded_speed=request["commanded_speed"],
-            target_velocity_deg_s=request["target_velocity_deg_s"],
+        self.execution_latency.bind_transmission(
+            request["trial_id"], command_id, t_tx
         )
 
     @staticmethod
@@ -1253,10 +1285,7 @@ class MainWindow(QMainWindow):
                 state.joints_current.A5,
                 state.joints_current.A6,
             ]
-        responses = self.execution_latency.update_telemetry(positions, t_rx)
-        if responses:
-            with self._motion_request_lock:
-                self._latest_motion_response = responses[-1]
+        self.execution_latency.update_telemetry(positions, t_rx)
 
     def move_to_start(self):
         """Move the robot to the first target in the planned path."""
@@ -1282,22 +1311,10 @@ class MainWindow(QMainWindow):
             self.move_to_start_complete = False
             self.move_to_start_error = None
             self.move_to_start_target = start_angles
-            current_angles = self.manager.get_joint_angles_list()
-            direction_index = max(
-                range(6),
-                key=lambda index: abs(start_angles[index] - current_angles[index]),
-            )
-            direction = start_angles[direction_index] - current_angles[direction_index]
-            if direction != 0.0:
-                with self._motion_request_lock:
-                    self._pending_motion_request = {
-                        "t_gui": time.perf_counter(),
-                        "joint_index": direction_index,
-                        "direction": direction,
-                        "commanded_speed": velocity,
-                        "target_velocity_deg_s": None,
-                        "kind": "CMD Move Joint",
-                    }
+
+            # Execution-latency trials are currently restricted to controlled JOG commands.
+            # Move-to-start is excluded because its CRI TX correlation is not yet part of
+            # the validated latency experiment protocol.
 
             self.move_to_start_thread = threading.Thread(
                 target=self._move_to_start_worker,
@@ -1458,22 +1475,18 @@ class MainWindow(QMainWindow):
             now = time.perf_counter()
             network.expire_pending(now)
             self.execution_latency.expire_pending(now)
-            with self._motion_request_lock:
-                motion_response = self._latest_motion_response
+            self._flush_completed_latency_trials()
+            snapshot = self.execution_latency.snapshot
             self.latency_panel.update_values(
                 rtt_ms=network.statistics.latest_ms,
                 one_way_ms=network.estimated_one_way_ms,
                 jitter_ms=network.statistics.peak_consecutive_jitter_ms,
                 mean_ms=network.statistics.mean_ms,
                 std_ms=network.statistics.std_ms,
-                gui_to_motion_ms=(
-                    motion_response.gui_to_motion_ms if motion_response else None
-                ),
-                tx_to_motion_ms=(
-                    motion_response.tx_to_motion_ms if motion_response else None
-                ),
-                gui_to_tx_ms=(motion_response.gui_to_tx_ms if motion_response else None),
-                status=self.execution_latency.latest_status,
+                gui_to_motion_ms=(snapshot.gui_to_motion_ms if snapshot else None),
+                tx_to_motion_ms=(snapshot.tx_to_motion_ms if snapshot else None),
+                gui_to_tx_ms=(snapshot.gui_to_tx_ms if snapshot else None),
+                status=snapshot.status if snapshot else None,
             )
 
             if self.is_recording_diagnostics:

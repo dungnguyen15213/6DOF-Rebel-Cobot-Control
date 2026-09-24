@@ -368,7 +368,12 @@ class CRIController:
                     logger.exception("Status callback failed")
 
             if isinstance(answer_id, str) and answer_id.isdigit():
-                self.network_latency.record_received(answer_id, received_at)
+                # CMDERROR notifications also carry the numeric command id as
+                # "answer", but must not count toward "CRI ACK RTT" statistics.
+                if notification.get("error") is not None:
+                    self.network_latency.record_error(answer_id, received_at)
+                else:
+                    self.network_latency.record_received(answer_id, received_at)
 
             if answer_id == "CAN":
                 self.can_queue.put_nowait(notification["can"])

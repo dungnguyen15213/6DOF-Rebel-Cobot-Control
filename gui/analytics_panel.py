@@ -238,7 +238,7 @@ class LatencyDiagnosticsPanel(QWidget):
         self.lbl_gui_motion = QLabel("GUI -> Motion Response: --")
         self.lbl_tx_motion = QLabel("TX -> Motion Response: --")
         self.lbl_gui_tx = QLabel("GUI -> TX Delay: --")
-        self.lbl_motion_status = QLabel("Measurement State: --")
+        self.lbl_motion_status = QLabel("Status: --")
         motion_grid.addWidget(self.lbl_gui_motion, 0, 0)
         motion_grid.addWidget(self.lbl_tx_motion, 0, 1)
         motion_grid.addWidget(self.lbl_gui_tx, 1, 0)
@@ -258,5 +258,5 @@ class LatencyDiagnosticsPanel(QWidget):
         self.lbl_tx_motion.setText(f"TX -> Motion Response: {text(tx_to_motion_ms)}")
         self.lbl_gui_tx.setText(f"GUI -> TX Delay: {text(gui_to_tx_ms)}")
         self.lbl_motion_status.setText(
-            f"Measurement State: {getattr(status, 'value', status) or '--'}"
+            f"Status: {getattr(status, 'value', status) or '--'}"
         )

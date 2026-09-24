@@ -8,6 +8,7 @@ from enum import Enum
 import statistics
 import threading
 import time
+import uuid
 from typing import Deque, Iterable
 
 
@@ -116,6 +117,8 @@ class NetworkLatencyTracker:
 
     def __init__(self, max_samples: int = 1000, pending_ttl_s: float = 10.0) -> None:
         self.statistics = LatencyStatistics(max_samples)
+        self.error_statistics = LatencyStatistics(max_samples)
+        self._error_count = 0
         self._max_pending = max_samples
         self.pending_ttl_s = pending_ttl_s
         self._pending: dict[str, float] = {}
@@ -159,6 +162,30 @@ class NetworkLatencyTracker:
         self.statistics.add(rtt_ms)
         return rtt_ms
 
+    def record_error(
+        self, command_id: str, timestamp: float | None = None
+    ) -> float | None:
+        """Records a CMDERROR response time separately from ACK RTT statistics.
+
+        CMDERROR responses are excluded from `statistics` so that "CRI ACK RTT"
+        only reflects successful command acknowledgments.
+        """
+        received_at = time.perf_counter() if timestamp is None else timestamp
+        with self._lock:
+            self._expire_pending_locked(received_at)
+            sent_at = self._pending.pop(str(command_id), None)
+            self._error_count += 1
+        if sent_at is None:
+            return None
+        error_rtt_ms = max(0.0, (received_at - sent_at) * 1000.0)
+        self.error_statistics.add(error_rtt_ms)
+        return error_rtt_ms
+
+    @property
+    def error_count(self) -> int:
+        with self._lock:
+            return self._error_count
+
     @property
     def estimated_one_way_ms(self) -> float | None:
         """Return RTT/2, an estimate assuming approximately symmetric delay.
@@ -180,7 +207,7 @@ class MeasurementStatus(str, Enum):
 
 @dataclass(frozen=True)
 class MotionResponse:
-    """A telemetry-observed motion-onset measurement."""
+    """A telemetry-observed motion-onset measurement for one DETECTED trial."""
 
     command_id: str
     joint_index: int
@@ -192,9 +219,50 @@ class MotionResponse:
     status: MeasurementStatus = MeasurementStatus.DETECTED
 
 
+@dataclass(frozen=True)
+class ExecutionLatencySnapshot:
+    """Atomic view of the most recently started or completed trial.
+
+    Status and latency values always belong to the same `trial_id`, so a GUI
+    reading this snapshot cannot mix a stale response with a newer status.
+    """
+
+    trial_id: str | None
+    status: MeasurementStatus | None
+    gui_to_tx_ms: float | None
+    tx_to_motion_ms: float | None
+    gui_to_motion_ms: float | None
+    response: MotionResponse | None = None
+
+
+@dataclass(frozen=True)
+class CompletedTrial:
+    """Immutable, fully-populated record of one finished trial for event logging."""
+
+    trial_id: str
+    command_id: str
+    command_type: str
+    joint_index: int
+    direction: float
+    commanded_speed: float | None
+    target_velocity_deg_s: float | None
+    t_gui: float
+    t_tx: float | None
+    t_motion: float | None
+    gui_to_tx_ms: float | None
+    tx_to_motion_ms: float | None
+    gui_to_motion_ms: float | None
+    motion_threshold_deg_s: float | None
+    stationary_velocity_std_deg_s: float | None
+    confirmation_samples: int
+    status: MeasurementStatus
+
+
 @dataclass
 class _MotionCommand:
-    command_id: str
+    command_id: str | None
+    trial_id: str
+    command_type: str
     t_gui: float
     t_tx: float | None
     joint_index: int
@@ -204,7 +272,6 @@ class _MotionCommand:
     consecutive_motion_samples: int = 0
     candidate_motion_time: float | None = None
     timeout_at: float | None = None
-    status: MeasurementStatus = MeasurementStatus.PENDING
 
 
 class ExecutionLatencyTracker:
@@ -213,6 +280,10 @@ class ExecutionLatencyTracker:
     The result is telemetry-observed motion response latency, not pure actuator
     latency. It includes GUI scheduling, network/controller processing, servo
     response, STATUS sampling, return transmission, and PC parsing delay.
+
+    Every trial is finalized through a single atomic completion path
+    (`_complete_trial_locked`) so `_pending`, the latest snapshot, and the
+    completed-trial event queue never disagree about a trial's outcome.
     """
 
     def __init__(
@@ -242,8 +313,15 @@ class ExecutionLatencyTracker:
         self._stationary_velocities: list[Deque[float]] = [
             deque(maxlen=max_samples) for _ in range(6)
         ]
-        self._last_status: MeasurementStatus | None = None
+        self._latest_snapshot: ExecutionLatencySnapshot | None = None
+        self._completed_trials: list[CompletedTrial] = []
+        self._trial_session_id = uuid.uuid4().hex[:8].upper()
+        self._trial_sequence = 0
         self._lock = threading.RLock()
+
+    def _next_trial_id_locked(self) -> str:
+        self._trial_sequence += 1
+        return f"LAT-{self._trial_session_id}-{self._trial_sequence:06d}"
 
     def start_command(
         self,
@@ -255,19 +333,20 @@ class ExecutionLatencyTracker:
         target_velocity_deg_s: float | None = None,
         t_tx: float | None = None,
         timeout_s: float | None = None,
-    ) -> None:
+        command_type: str = "ALIVEJOG",
+    ) -> str:
+        """Arms a new controlled trial and returns its unique `trial_id`."""
         if not 0 <= joint_index < 6:
             raise ValueError("joint_index must be between 0 and 5")
         if direction == 0.0:
             raise ValueError("direction must be positive or negative")
         with self._lock:
-            if abs(self._previous_velocities[joint_index]) >= self._threshold(joint_index):
-                self._last_status = MeasurementStatus.INVALID_ALREADY_MOVING
-                return
-            self._pending.clear()
             started_at = time.perf_counter() if t_gui is None else t_gui
-            self._pending[str(command_id)] = _MotionCommand(
+            trial_id = self._next_trial_id_locked()
+            command = _MotionCommand(
                 command_id=str(command_id),
+                trial_id=trial_id,
+                command_type=command_type,
                 t_gui=started_at,
                 t_tx=t_tx,
                 joint_index=joint_index,
@@ -276,24 +355,114 @@ class ExecutionLatencyTracker:
                 target_velocity_deg_s=target_velocity_deg_s,
                 timeout_at=started_at + (self.motion_timeout_s if timeout_s is None else timeout_s),
             )
+            if abs(self._previous_velocities[joint_index]) >= self._threshold(joint_index):
+                self._complete_trial_locked(command, MeasurementStatus.INVALID_ALREADY_MOVING, started_at)
+                return trial_id
+            if self._pending:
+                # Defensive: a new trial supersedes any unfinished one instead of
+                # leaving it to be silently discarded and possibly misreported.
+                stale_command = next(iter(self._pending.values()))
+                self._complete_trial_locked(stale_command, MeasurementStatus.CANCELLED, started_at)
+            self._pending[command.command_id] = command
+            self._latest_snapshot = ExecutionLatencySnapshot(
+                trial_id=trial_id,
+                status=MeasurementStatus.PENDING,
+                gui_to_tx_ms=(t_tx - started_at) * 1000.0 if t_tx is not None else None,
+                tx_to_motion_ms=None,
+                gui_to_motion_ms=None,
+                response=None,
+            )
+            return trial_id
 
-    def cancel_pending(self, status: MeasurementStatus = MeasurementStatus.CANCELLED) -> None:
+    def arm_trial(
+        self,
+        t_gui: float | None = None,
+        joint_index: int = 0,
+        direction: float = 0.0,
+        commanded_speed: float | None = None,
+        target_velocity_deg_s: float | None = None,
+        timeout_s: float | None = None,
+        command_type: str = "ALIVEJOG",
+    ) -> str:
+        """Arms a GUI-originated trial before its CRI command is transmitted."""
+        if not 0 <= joint_index < 6:
+            raise ValueError("joint_index must be between 0 and 5")
+        if direction == 0.0:
+            raise ValueError("direction must be positive or negative")
         with self._lock:
-            self._pending.clear()
-            self._last_status = status
+            started_at = time.perf_counter() if t_gui is None else t_gui
+            trial_id = self._next_trial_id_locked()
+            command = _MotionCommand(
+                command_id=None,
+                trial_id=trial_id,
+                command_type=command_type,
+                t_gui=started_at,
+                t_tx=None,
+                joint_index=joint_index,
+                direction=1.0 if direction > 0.0 else -1.0,
+                commanded_speed=commanded_speed,
+                target_velocity_deg_s=target_velocity_deg_s,
+                timeout_at=started_at + (self.motion_timeout_s if timeout_s is None else timeout_s),
+            )
+            if abs(self._previous_velocities[joint_index]) >= self._threshold(joint_index):
+                self._complete_trial_locked(command, MeasurementStatus.INVALID_ALREADY_MOVING, started_at)
+                return trial_id
+            if self._pending:
+                stale_command = next(iter(self._pending.values()))
+                self._complete_trial_locked(stale_command, MeasurementStatus.CANCELLED, started_at)
+            self._pending[trial_id] = command
+            self._latest_snapshot = ExecutionLatencySnapshot(
+                trial_id=trial_id,
+                status=MeasurementStatus.PENDING,
+                gui_to_tx_ms=None,
+                tx_to_motion_ms=None,
+                gui_to_motion_ms=None,
+                response=None,
+            )
+            return trial_id
+
+    def bind_transmission(
+        self, trial_id: str, command_id: str, timestamp: float | None = None
+    ) -> bool:
+        """Binds the first matching CRI transmission to an armed GUI trial."""
+        with self._lock:
+            command = self._pending.pop(trial_id, None)
+            if command is None or command.command_id is not None:
+                return False
+            command.command_id = str(command_id)
+            command.t_tx = time.perf_counter() if timestamp is None else timestamp
+            self._pending[command.command_id] = command
+            self._latest_snapshot = ExecutionLatencySnapshot(
+                trial_id=command.trial_id,
+                status=MeasurementStatus.PENDING,
+                gui_to_tx_ms=(command.t_tx - command.t_gui) * 1000.0,
+                tx_to_motion_ms=None,
+                gui_to_motion_ms=None,
+                response=None,
+            )
+            return True
+
+    def cancel_pending(
+        self, status: MeasurementStatus = MeasurementStatus.CANCELLED, timestamp: float | None = None
+    ) -> bool:
+        """Cancels the active trial, if any. Never overwrites a completed trial."""
+        with self._lock:
+            if not self._pending:
+                return False
+            now = time.perf_counter() if timestamp is None else timestamp
+            command = next(iter(self._pending.values()))
+            self._complete_trial_locked(command, status, now)
+            return True
 
     def expire_pending(self, timestamp: float | None = None) -> bool:
-        """Mark an unobserved active trial as timed out without waiting for STATUS."""
+        """Finalizes an unobserved active trial as TIMEOUT once its deadline passes."""
         now = time.perf_counter() if timestamp is None else timestamp
         with self._lock:
-            timed_out = any(
-                command.timeout_at is not None and now >= command.timeout_at
-                for command in self._pending.values()
-            )
-            if timed_out:
-                self._pending.clear()
-                self._last_status = MeasurementStatus.TIMEOUT
-            return timed_out
+            for command in list(self._pending.values()):
+                if command.timeout_at is not None and now >= command.timeout_at:
+                    self._complete_trial_locked(command, MeasurementStatus.TIMEOUT, now)
+                    return True
+            return False
 
     def get_stationary_velocity_std(self, joint_index: int) -> float | None:
         with self._lock:
@@ -310,8 +479,88 @@ class ExecutionLatencyTracker:
     def record_transmission(self, command_id: str, timestamp: float | None = None) -> None:
         with self._lock:
             command = self._pending.get(str(command_id))
-            if command is not None:
-                command.t_tx = time.perf_counter() if timestamp is None else timestamp
+            if command is None:
+                return
+            command.t_tx = time.perf_counter() if timestamp is None else timestamp
+            if self._latest_snapshot is not None and self._latest_snapshot.trial_id == command.trial_id:
+                self._latest_snapshot = ExecutionLatencySnapshot(
+                    trial_id=command.trial_id,
+                    status=self._latest_snapshot.status,
+                    gui_to_tx_ms=(command.t_tx - command.t_gui) * 1000.0,
+                    tx_to_motion_ms=self._latest_snapshot.tx_to_motion_ms,
+                    gui_to_motion_ms=self._latest_snapshot.gui_to_motion_ms,
+                    response=self._latest_snapshot.response,
+                )
+
+    def _complete_trial_locked(
+        self,
+        command: _MotionCommand,
+        status: MeasurementStatus,
+        completed_at: float,
+        motion_time: float | None = None,
+    ) -> tuple[CompletedTrial, MotionResponse | None]:
+        """Single atomic finalization path for every trial outcome.
+
+        Finalizes status, builds exactly one `CompletedTrial` event, updates the
+        snapshot the GUI reads, and clears the trial from `_pending`.
+        """
+        gui_to_tx_ms = (command.t_tx - command.t_gui) * 1000.0 if command.t_tx is not None else None
+        tx_to_motion_ms: float | None = None
+        gui_to_motion_ms: float | None = None
+        response: MotionResponse | None = None
+        threshold = self._threshold(command.joint_index)
+        stationary_std = self.get_stationary_velocity_std(command.joint_index)
+
+        if status == MeasurementStatus.DETECTED and motion_time is not None:
+            gui_to_motion_ms = (motion_time - command.t_gui) * 1000.0
+            tx_to_motion_ms = (
+                (motion_time - command.t_tx) * 1000.0 if command.t_tx is not None else None
+            )
+            response = MotionResponse(
+                command_id=command.command_id,
+                joint_index=command.joint_index,
+                gui_to_motion_ms=gui_to_motion_ms,
+                tx_to_motion_ms=tx_to_motion_ms,
+                gui_to_tx_ms=gui_to_tx_ms,
+                motion_threshold_deg_s=threshold,
+                stationary_velocity_std_deg_s=stationary_std or 0.0,
+            )
+            self.responses.append(response)
+            self.statistics.add(gui_to_motion_ms)
+
+        trial = CompletedTrial(
+            trial_id=command.trial_id,
+            command_id=command.command_id or "",
+            command_type=command.command_type,
+            joint_index=command.joint_index,
+            direction=command.direction,
+            commanded_speed=command.commanded_speed,
+            target_velocity_deg_s=command.target_velocity_deg_s,
+            t_gui=command.t_gui,
+            t_tx=command.t_tx,
+            t_motion=motion_time if status == MeasurementStatus.DETECTED else None,
+            gui_to_tx_ms=gui_to_tx_ms,
+            tx_to_motion_ms=tx_to_motion_ms,
+            gui_to_motion_ms=gui_to_motion_ms,
+            motion_threshold_deg_s=threshold,
+            stationary_velocity_std_deg_s=stationary_std,
+            confirmation_samples=command.consecutive_motion_samples,
+            status=status,
+        )
+        self._completed_trials.append(trial)
+        self._latest_snapshot = ExecutionLatencySnapshot(
+            trial_id=command.trial_id,
+            status=status,
+            gui_to_tx_ms=gui_to_tx_ms,
+            tx_to_motion_ms=tx_to_motion_ms,
+            gui_to_motion_ms=gui_to_motion_ms,
+            response=response,
+        )
+        for pending_key, pending_command in list(self._pending.items()):
+            if pending_command is command:
+                del self._pending[pending_key]
+                break
+        return trial, response
 
     def update_telemetry(
         self,
@@ -344,8 +593,7 @@ class ExecutionLatencyTracker:
             detected: list[MotionResponse] = []
             for command_id, command in list(self._pending.items()):
                 if command.timeout_at is not None and now >= command.timeout_at:
-                    self._last_status = MeasurementStatus.TIMEOUT
-                    del self._pending[command_id]
+                    self._complete_trial_locked(command, MeasurementStatus.TIMEOUT, now)
                     continue
                 threshold = self._threshold(command.joint_index)
                 velocity = velocities[command.joint_index]
@@ -364,30 +612,35 @@ class ExecutionLatencyTracker:
                     command.candidate_motion_time = None
                 if command.consecutive_motion_samples < self.required_consecutive_samples:
                     continue
-                response = MotionResponse(
-                    command_id=command_id,
-                    joint_index=command.joint_index,
-                    gui_to_motion_ms=((command.candidate_motion_time or now) - command.t_gui) * 1000.0,
-                    tx_to_motion_ms=((command.candidate_motion_time or now) - command.t_tx) * 1000.0
-                    if command.t_tx is not None
-                    else None,
-                    gui_to_tx_ms=(command.t_tx - command.t_gui) * 1000.0 if command.t_tx is not None else None,
-                    motion_threshold_deg_s=threshold,
-                    stationary_velocity_std_deg_s=self.get_stationary_velocity_std(command.joint_index) or 0.0,
+                _, response = self._complete_trial_locked(
+                    command,
+                    MeasurementStatus.DETECTED,
+                    now,
+                    motion_time=command.candidate_motion_time or now,
                 )
-                self.responses.append(response)
-                self.statistics.add(response.gui_to_motion_ms)
-                self._last_status = MeasurementStatus.DETECTED
-                detected.append(response)
-                del self._pending[command_id]
+                if response is not None:
+                    detected.append(response)
             return tuple(detected)
+
+    @property
+    def snapshot(self) -> ExecutionLatencySnapshot | None:
+        """Atomic snapshot of the most recent trial's status and latency values."""
+        with self._lock:
+            return self._latest_snapshot
+
+    def drain_completed_trials(self) -> list[CompletedTrial]:
+        """Returns and clears newly completed trials; each trial is returned once."""
+        with self._lock:
+            drained = list(self._completed_trials)
+            self._completed_trials.clear()
+            return drained
 
     @property
     def latest_response(self) -> MotionResponse | None:
         with self._lock:
-            return self.responses[-1] if self.responses else None
+            return self._latest_snapshot.response if self._latest_snapshot else None
 
     @property
     def latest_status(self) -> MeasurementStatus | None:
         with self._lock:
-            return self._last_status
+            return self._latest_snapshot.status if self._latest_snapshot else None

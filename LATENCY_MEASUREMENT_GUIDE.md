@@ -12,7 +12,7 @@ $$
 RTT_i = (t_{rx,i} - t_{tx,i}) \times 1000\ \mathrm{ms}
 $$
 
-Only ACKs matching a pending command ID contribute samples. STATUS and unsolicited messages do not affect RTT. The displayed one-way value is an estimate:
+Only successful `CMDACK` responses matching a pending command ID contribute to CRI ACK RTT samples. `CMDERROR` response times are tracked separately and STATUS or unsolicited messages do not affect RTT. The displayed one-way value is an estimate:
 
 $$
 D_{oneway,i} \approx RTT_i / 2
@@ -24,7 +24,7 @@ $$
 J_{peak} = \max_i |RTT_i - RTT_{i-1}|
 $$
 
-The tracker keeps a bounded history and removes unmatched command IDs after a configurable timeout.
+The tracker keeps a bounded history and removes unmatched command IDs after a configurable timeout. This is Method 1, a CRI command-response communication experiment.
 
 ## Telemetry-Observed Motion Response
 
@@ -42,7 +42,11 @@ $$
 L_{gui-tx} = (t_{tx} - t_{gui}) \times 1000\ \mathrm{ms}
 $$
 
-This is telemetry-observed motion response, not pure actuator latency. It includes GUI scheduling, transport, controller and servo processing, STATUS sampling, return transport, and local packet handling. A trial can end as `DETECTED`, `TIMEOUT`, `INVALID_ALREADY_MOVING`, or `CANCELLED`; only `DETECTED` produces a motion-latency sample.
+This is Method 2, a JOG GUI/TX-to-telemetry-observed motion-response experiment, not pure actuator latency. It includes GUI scheduling, transport, controller and servo processing, STATUS sampling, return transport, and local packet handling. A trial can end as `DETECTED`, `TIMEOUT`, `INVALID_ALREADY_MOVING`, or `CANCELLED`; only `DETECTED` produces a motion-latency sample. Method 1 and Method 2 are separate measurements: $RTT/2$ must not be added to or interpreted as physical response time.
+
+## Trial Event Records
+
+`latency_experiments.csv` is event based: the application writes exactly one row for every finalized trial, including detected, timed-out, invalid, and cancelled trials. Each row is identified by a session-scoped `LAT-<session>-xxxxxx` trial ID and includes wall-clock metadata, monotonic timestamp values, GUI-to-TX, TX-to-motion, GUI-to-motion, RTT diagnostics, threshold/noise metadata, and final status. Paper execution-latency statistics must use this event log rather than the high-frequency analytics telemetry CSV.
 
 ## Experimental Procedure
 

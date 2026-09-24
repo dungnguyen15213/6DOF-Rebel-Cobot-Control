@@ -57,6 +57,25 @@ class RebelManagerStatusTest(unittest.TestCase):
 
         self.assertEqual(callback_times, [12.5])
 
+    def test_cmderror_response_is_excluded_from_ack_rtt_statistics(self) -> None:
+        controller = CRIController()
+        controller.network_latency.record_sent("7", timestamp=1.0)
+
+        controller._parse_message("CRISTART 99 CMDERROR 7 SomeFault CRIEND", t_rx=1.05)
+
+        self.assertEqual(controller.network_latency.statistics.count, 0)
+        self.assertEqual(controller.network_latency.error_statistics.count, 1)
+        self.assertEqual(controller.network_latency.error_count, 1)
+
+    def test_cmdack_response_contributes_to_ack_rtt_statistics(self) -> None:
+        controller = CRIController()
+        controller.network_latency.record_sent("7", timestamp=1.0)
+
+        controller._parse_message("CRISTART 99 CMDACK 7 CRIEND", t_rx=1.05)
+
+        self.assertEqual(controller.network_latency.statistics.count, 1)
+        self.assertEqual(controller.network_latency.error_statistics.count, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

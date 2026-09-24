@@ -218,6 +218,7 @@ class TelemetryRecord:
     cri_rtt_ms: float | None = None
     estimated_one_way_ms: float | None = None
     rtt_jitter_ms: float | None = None
+    gui_to_tx_ms: float | None = None
     gui_to_motion_ms: float | None = None
     tx_to_motion_ms: float | None = None
     rtt_mean_ms: float | None = None
