@@ -249,13 +249,10 @@ class StickViewer(QWidget):
             self.joint_labels[i].set_position((x_data[i+1] + 20, y_data[i+1] + 20))
             self.joint_labels[i].set_3d_properties(z_data[i+1] + 20, 'z')
 
-        # 5. Update the tool tip trail.
-        if tip_trail is None:
-            self.tip_trail.append(points[-1])
-            trail_array = np.array(self.tip_trail)
-        else:
-            self.tip_trail = [np.array(p) for p in tip_trail]
-            trail_array = np.array(self.tip_trail)
+        # 5. Trails are caller-owned so a pose refresh cannot create a trail.
+        trail_points = tip_trail if tip_trail is not None else []
+        self.tip_trail = [np.array(p) for p in trail_points]
+        trail_array = np.array(self.tip_trail)
 
         if trail_array.size == 0:
             self.tip_trail_line.set_data([], [])

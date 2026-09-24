@@ -1,0 +1,15 @@
+ff_rls:
+  forgetting_factor: 0.98
+  initial_covariance: 1000.0
+  n_params: 3
+cusum:
+  k: 0.5
+  h: 5.0
+payload:
+  filter_alpha: 0.05
+  mass_sensitivity_gain: 200.0
+  attach_threshold_g: 50.0
+logging:
+  output_dir: experiments
+  run_prefix: run
+  flush_every: 1

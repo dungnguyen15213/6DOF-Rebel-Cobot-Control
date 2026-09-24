@@ -1,11 +1,13 @@
 import time
 from cri_lib.cri_controller import CRIController
+from cri_lib.cri_errors import CRICommandTimeOutError
 
 
 class RebelManager:
     """Handles all communication with the physical Igus ReBeL robot via CRI."""
 
     DEFAULT_SUPPLY_VOLTAGE_MV = 24000
+    PATH_COMMAND_INTERVAL_SEC = 1.0 / 30.0
 
     def __init__(self):
         self.robot = CRIController()
@@ -130,3 +132,53 @@ class RebelManager:
     def maintain_jog(self):
         if self.robot.connected and any(v != 0.0 for v in self.current_jog_speeds.values()):
             self.robot.set_jog_values(**self.current_jog_speeds)
+
+    def execute_path(self, path_data, velocity, stop_event=None):
+        """Dispatch ordered targets at 30 Hz and wait for final CRI completion.
+
+        This matches the established execution behavior: intermediate point
+        targets are paced over CRI rather than sent as a TCP burst, while CRI
+        remains responsible for all motion profiling. The final ``EXECEND``
+        confirms physical completion before the UI reports success.
+        """
+        if not path_data:
+            return False, "Empty path"
+        if not self.robot.connected:
+            return False, "Robot not connected"
+
+        error_message = None
+        start_time = time.monotonic()
+        final_waypoint_index = len(path_data) - 1
+        for idx, angles in enumerate(path_data):
+            if stop_event is not None and stop_event.is_set():
+                error_message = "Execution stopped by user."
+                break
+            if not self.robot.connected:
+                error_message = "Robot disconnected during execution!"
+                break
+
+            dispatch_time = start_time + idx * self.PATH_COMMAND_INTERVAL_SEC
+            remaining = dispatch_time - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+
+            try:
+                success = self.robot.move_joints(
+                    A1=angles[0], A2=angles[1], A3=angles[2],
+                    A4=angles[3], A5=angles[4], A6=angles[5],
+                    E1=0.0, E2=0.0, E3=0.0,
+                    velocity=velocity,
+                    wait_move_finished=idx == final_waypoint_index,
+                    move_finished_timeout=60.0,
+                )
+            except CRICommandTimeOutError:
+                error_message = f"Timed out sending waypoint {idx}."
+                break
+            except Exception as e:
+                error_message = f"Error sending waypoint {idx}: {e}"
+                break
+            if not success:
+                error_message = f"Failed to execute waypoint {idx}."
+                break
+
+        return error_message is None, error_message
