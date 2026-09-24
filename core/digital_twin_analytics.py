@@ -212,10 +212,22 @@ class TelemetryRecord:
     collision_detected: bool
     estimated_mass_g: float
     payload_status: str
+    timestamp: float | None = None
+    command_id: str | None = None
+    joint_index: int | None = None
+    cri_rtt_ms: float | None = None
+    estimated_one_way_ms: float | None = None
+    rtt_jitter_ms: float | None = None
+    gui_to_motion_ms: float | None = None
+    tx_to_motion_ms: float | None = None
+    rtt_mean_ms: float | None = None
+    rtt_std_ms: float | None = None
+    rtt_p95_ms: float | None = None
+    rtt_p99_ms: float | None = None
 
 
 class TelemetryLogger:
-    """Logs synchronization latency and per-cycle analytics results to CSV."""
+    """Logs analytics rows and scientifically separated latency metrics."""
 
     FIELDNAMES = list(TelemetryRecord.__dataclass_fields__.keys())
 
@@ -225,15 +237,37 @@ class TelemetryLogger:
         self._rows_since_flush = 0
 
         is_new_file = not os.path.exists(csv_path)
+        fieldnames = self.FIELDNAMES
+        if not is_new_file:
+            with open(csv_path, mode="r", newline="", encoding="utf-8") as existing:
+                reader = csv.DictReader(existing)
+                existing_fieldnames = reader.fieldnames or []
+                missing_fields = [
+                    field for field in self.FIELDNAMES if field not in existing_fieldnames
+                ]
+                if missing_fields:
+                    rows = list(reader)
+                    fieldnames = [*existing_fieldnames, *missing_fields]
+                    with open(csv_path, mode="w", newline="", encoding="utf-8") as migrated:
+                        writer = csv.DictWriter(migrated, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(rows)
+                else:
+                    fieldnames = existing_fieldnames
         self._file = open(csv_path, mode="a", newline="", encoding="utf-8")
-        self._writer = csv.DictWriter(self._file, fieldnames=self.FIELDNAMES)
+        self._writer = csv.DictWriter(
+            self._file, fieldnames=fieldnames, extrasaction="ignore"
+        )
         if is_new_file:
             self._writer.writeheader()
             self._file.flush()
 
     @staticmethod
     def compute_sync_delay(t_gui: float, t_physical: float) -> float:
-        """Computes delta_t = t_physical - t_gui, the round-trip sync delay."""
+        """Legacy compatibility helper for old log consumers.
+
+        This is local processing elapsed time, not CRI RTT or physical latency.
+        """
         return t_physical - t_gui
 
     def log(self, record: TelemetryRecord) -> None:
@@ -268,7 +302,7 @@ def example_integration_loop() -> None:
     with TelemetryLogger("robot_diagnostics_analytics.csv") as logger:
         for _ in range(5):
             # --- 1. Incoming CRI telemetry packet (simulated here) ---
-            t_gui = time.time()
+            t_gui = time.perf_counter()
             packet = {
                 "joint_id": "A3",
                 "q_dot": 12.5,          # deg/s
@@ -291,7 +325,8 @@ def example_integration_loop() -> None:
             # --- 4. Sensorless payload estimation from theta_hat ---
             estimated_mass_g, payload_status = payload_est.update(theta_hat)
 
-            # --- 5. Log sync latency + full analytics row ---
+            # --- 5. Log analytics row; network/motion latency is supplied by
+            # the CRI timing trackers in the live application. ---
             record = TelemetryRecord(
                 t_gui=t_gui,
                 t_virtual=packet["t_virtual"],

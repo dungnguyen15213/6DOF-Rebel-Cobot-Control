@@ -5,9 +5,10 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from queue import Empty, Queue
-from time import sleep, time
+from time import perf_counter, sleep, time
 from typing import Any, Callable
 
+from core.latency_tracking import NetworkLatencyTracker
 from .cri_errors import CRICommandTimeOutError, CRIConnectionError
 from .cri_protocol_parser import CRIProtocolParser
 from .robot_state import KinematicsState, RobotState
@@ -61,6 +62,8 @@ class CRIController:
         self.answer_events_lock = threading.Lock()
         self.answer_events: dict[str, threading.Event] = {}
         self.error_messages: dict[str, str] = {}
+        self.network_latency = NetworkLatencyTracker()
+        self.command_sent_callback: Callable[[str, str, float], None] | None = None
 
         self.status_callback: Callable | None = None
 
@@ -210,7 +213,14 @@ class CRIController:
 
         try:
             with self.socket_write_lock:
+                t_tx = perf_counter()
+                self.network_latency.record_sent(str(command_counter), t_tx)
                 self.sock.sendall(message.encode())
+            if self.command_sent_callback is not None:
+                try:
+                    self.command_sent_callback(str(command_counter), command, t_tx)
+                except Exception:
+                    logger.exception("Command timing callback failed")
             logger.debug("Sent command: %s", message)
 
             return command_counter
@@ -277,7 +287,8 @@ class CRIController:
                     # check if there is a complete message
                     if start_idx != -1:
                         message = message_buffer[start_idx : end_idx + 6].decode()
-                        self._parse_message(message)
+                        t_rx = perf_counter()
+                        self._parse_message(message, t_rx)
 
                     # check if there is data left in the buffer
                     if len(message_buffer) > end_idx + 7:
@@ -341,16 +352,21 @@ class CRIController:
             else:
                 return None
 
-    def _parse_message(self, message: str) -> None:
+    def _parse_message(self, message: str, t_rx: float | None = None) -> None:
         """Internal function to parse a message. If an answer event is registered for a certain msg_id it is triggered."""
+        received_at = perf_counter() if t_rx is None else t_rx
         if "STATUS" not in message:
             logger.debug("Received: %s", message)
 
         if (notification := self.parser.parse_message(message)) is not None:
-            if notification["answer"] == "status" and self.status_callback is not None:
-                self.status_callback(self.robot_state)
+            answer_id = notification["answer"]
+            if answer_id == "status" and self.status_callback is not None:
+                self.status_callback(self.robot_state, received_at)
 
-            if notification["answer"] == "CAN":
+            if isinstance(answer_id, str) and answer_id.isdigit():
+                self.network_latency.record_received(answer_id, received_at)
+
+            if answer_id == "CAN":
                 self.can_queue.put_nowait(notification["can"])
 
             with self.answer_events_lock:
@@ -391,6 +407,16 @@ class CRIController:
             callback function to be called, pass `None` to deregister a callback
         """
         self.status_callback = callback
+
+    def register_command_sent_callback(
+        self, callback: Callable[[str, str, float], None] | None
+    ) -> None:
+        """Register a lightweight callback after a command is sent.
+
+        The callback receives the CRI command ID, command text, and the
+        monotonic timestamp captured immediately before ``sendall``.
+        """
+        self.command_sent_callback = callback
 
     def reset(self) -> bool:
         """Reset robot

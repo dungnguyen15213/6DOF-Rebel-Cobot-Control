@@ -6,17 +6,19 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGr
                              QGroupBox, QLabel, QPushButton, QLineEdit, QMessageBox,
                              QComboBox, QDoubleSpinBox, QDialog, QSpinBox, QFileDialog, QSlider, QScrollArea, QTabWidget, QCheckBox) 
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import QSplitter
 import numpy as np
 import csv
 
 from core.path_planner import PathPlanner
 from core.path_executor import PathExecutor
 from gui.stick_viewer import StickViewer
-from gui.analytics_panel import AnalyticsPanel
+from gui.analytics_panel import AnalyticsPanel, AlgorithmTuningPanel, LatencyDiagnosticsPanel
 from core.kinematics import ReBelKinematics
 from core.digital_twin_analytics import (
     AdaptiveBaselineRLS, CUSUMDetector, PayloadEstimator, TelemetryLogger, TelemetryRecord,
 )
+from core.latency_tracking import ExecutionLatencyTracker
 from hardware.robot_manager import RebelManager
 from settings import get_settings, save_settings, FFRLSSettings, CUSUMSettings, PayloadSettings
 
@@ -92,9 +94,13 @@ class MainWindow(QMainWindow):
         
         self.manager = RebelManager()
         self.kinematics = ReBelKinematics()
+        self.execution_latency = ExecutionLatencyTracker()
+        self._motion_request_lock = threading.RLock()
+        self._pending_motion_request = None
+        self._latest_motion_response = None
         self._init_digital_twin_analytics()
         self.realtime_data_log = []
-        self.log_start_time = time.time()
+        self.log_start_time = time.perf_counter()
         self.is_recording_diagnostics = False
         self.execution_complete = False
         self.execution_saved = False
@@ -297,9 +303,9 @@ class MainWindow(QMainWindow):
             btn_neg.setEnabled(False)
             btn_pos.setEnabled(False)
             btn_neg.pressed.connect(lambda a=axis: self.start_jog_with_realtime(a, -15.0))
-            btn_neg.released.connect(self.manager.stop_jog)
+            btn_neg.released.connect(self.stop_jog_with_realtime)
             btn_pos.pressed.connect(lambda a=axis: self.start_jog_with_realtime(a, 15.0))
-            btn_pos.released.connect(self.manager.stop_jog)
+            btn_pos.released.connect(self.stop_jog_with_realtime)
             
             # Pack Label and Buttons tightly together into an inner horizontal layout
             cell_widget = QWidget()
@@ -632,17 +638,41 @@ class MainWindow(QMainWindow):
         real_tab = QWidget()
         real_tab_layout = QVBoxLayout(real_tab)
         real_tab_layout.setContentsMargins(6, 6, 6, 6)
+        real_tab_layout.setSpacing(6)
         self.real_view = StickViewer()
-        real_tab_layout.addWidget(self.real_view)
-        self.view_tabs.addTab(real_tab, "Real-time View")
 
-        # Analytics Tab (FF-RLS baseline, CUSUM collision, payload estimation)
+        # Keep the live robot view and its analytics visible together, as one
+        # vertical workspace rather than forcing the operator to change tabs.
         self.analytics_panel = AnalyticsPanel()
+        self.tuning_panel = AlgorithmTuningPanel()
+        self.latency_panel = LatencyDiagnosticsPanel()
         self.analytics_panel.btn_reset.clicked.connect(self._reset_digital_twin_analytics)
-        self.analytics_panel.load_tuning_values(get_settings())
-        self.analytics_panel.btn_apply_tuning.clicked.connect(self._apply_tuning_live)
-        self.analytics_panel.btn_save_tuning.clicked.connect(self._save_tuning_to_config)
-        self.view_tabs.addTab(self.analytics_panel, "Analytics")
+        self.tuning_panel.load_tuning_values(get_settings())
+        self.tuning_panel.btn_apply_tuning.clicked.connect(self._apply_tuning_live)
+        self.tuning_panel.btn_save_tuning.clicked.connect(self._save_tuning_to_config)
+
+        analytics_scroll = QScrollArea()
+        analytics_scroll.setWidgetResizable(True)
+        analytics_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        analytics_scroll.setWidget(self.analytics_panel)
+
+        diagnostics_tabs = QTabWidget()
+        diagnostics_tabs.addTab(analytics_scroll, "Analytics")
+        diagnostics_tabs.addTab(self.latency_panel, "Latency")
+        diagnostics_tabs.addTab(self.tuning_panel, "Algorithm Tuning")
+        diagnostics_tabs.setMinimumHeight(250)
+
+        realtime_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.real_view.setMinimumHeight(300)
+        realtime_splitter.addWidget(self.real_view)
+        realtime_splitter.addWidget(diagnostics_tabs)
+        realtime_splitter.setCollapsible(0, False)
+        realtime_splitter.setCollapsible(1, False)
+        realtime_splitter.setStretchFactor(0, 3)
+        realtime_splitter.setStretchFactor(1, 2)
+        realtime_splitter.setSizes([560, 300])
+        real_tab_layout.addWidget(realtime_splitter, 1)
+        self.view_tabs.addTab(real_tab, "Real-time View")
 
         main_layout.addWidget(left_sidebar)
         main_layout.addWidget(self.view_tabs, 1)
@@ -717,7 +747,22 @@ class MainWindow(QMainWindow):
 
     def start_jog_with_realtime(self, axis, speed):
         self._show_realtime_view()
+        joint_index = int(axis[1:]) - 1
+        with self._motion_request_lock:
+            self._pending_motion_request = {
+                "t_gui": time.perf_counter(),
+                "joint_index": joint_index,
+                "direction": speed,
+                "commanded_speed": speed,
+                "target_velocity_deg_s": None,
+                "kind": "ALIVEJOG",
+            }
         self.manager.start_jog(axis, speed)
+
+    def stop_jog_with_realtime(self):
+        with self._motion_request_lock:
+            self._pending_motion_request = None
+        self.manager.stop_jog()
 
     def _reset_trails(self):
         self.sim_tip_trail.clear()
@@ -1012,18 +1057,18 @@ class MainWindow(QMainWindow):
     def _apply_tuning_live(self):
         """Rebuilds the estimators from the panel's spin box values without
         touching config.yaml, so changes can be A/B tested in the lab."""
-        values = self.analytics_panel.get_tuning_values()
+        values = self.tuning_panel.get_tuning_values()
         new_settings = get_settings()
         new_settings.ff_rls = FFRLSSettings(**{**vars(new_settings.ff_rls), **values["ff_rls"]})
         new_settings.cusum = CUSUMSettings(**values["cusum"])
         new_settings.payload = PayloadSettings(**{**vars(new_settings.payload), **values["payload"]})
         self._reset_digital_twin_analytics()
-        self.analytics_panel.lbl_tuning_status.setText("Applied live (not saved to config.yaml).")
+        self.tuning_panel.lbl_tuning_status.setText("Applied live (not saved to config.yaml).")
 
     def _save_tuning_to_config(self):
         """Persists the panel's spin box values to config.yaml and applies
         them immediately."""
-        values = self.analytics_panel.get_tuning_values()
+        values = self.tuning_panel.get_tuning_values()
         updated = get_settings()
         updated.ff_rls = FFRLSSettings(**{**vars(updated.ff_rls), **values["ff_rls"]})
         updated.cusum = CUSUMSettings(**values["cusum"])
@@ -1034,18 +1079,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Save Failed", f"Could not save config.yaml:\n{e}")
             return
         self._reset_digital_twin_analytics()
-        self.analytics_panel.lbl_tuning_status.setText("Saved to config.yaml and applied live.")
+        self.tuning_panel.lbl_tuning_status.setText("Saved to config.yaml and applied live.")
 
     def _run_digital_twin_analytics(self, real_joints, real_currents):
         """Feeds the latest joint telemetry through FF-RLS -> CUSUM ->
         payload estimation for every joint and refreshes the Analytics tab.
 
-        t_gui/t_physical mark the start/end of this poll cycle; since the
-        CRI stream does not expose per-packet send timestamps, this is an
-        approximation of the GUI<->physical round-trip latency rather than
-        a true command-dispatch delay.
+        The local timing in this method measures analytics processing only.
+        Network RTT and telemetry-observed motion response are tracked at the
+        CRI socket and STATUS receive boundaries.
         """
-        t_gui = time.time()
+        processing_started = time.perf_counter()
+        t_gui = processing_started
 
         if self._analytics_prev_time is not None:
             dt = max(t_gui - self._analytics_prev_time, 1e-3)
@@ -1080,19 +1125,19 @@ class MainWindow(QMainWindow):
             self.analytics_panel.add_sample(i, record_time, real_currents[i], y_hat, residual)
 
             if i == selected:
-                t_physical = time.time()
-                sync_delay_ms = (t_physical - t_gui) * 1000.0
                 self.analytics_panel.update_status(
-                    cusum_score, collision_detected, mass_g, payload_status, sync_delay_ms
+                    cusum_score, collision_detected, mass_g, payload_status,
+                    (time.perf_counter() - processing_started) * 1000.0,
                 )
 
             if self.telemetry_logger is not None:
-                t_physical = time.time()
+                with self._motion_request_lock:
+                    motion_response = self._latest_motion_response
                 self.telemetry_logger.log(TelemetryRecord(
                     t_gui=t_gui,
                     t_virtual=t_gui,
-                    t_physical=t_physical,
-                    sync_delay_s=t_physical - t_gui,
+                    t_physical=t_gui,
+                    sync_delay_s=0.0,
                     joint_id=f"J{i+1}",
                     raw_current=real_currents[i],
                     rls_residual=residual,
@@ -1100,7 +1145,26 @@ class MainWindow(QMainWindow):
                     collision_detected=collision_detected,
                     estimated_mass_g=mass_g,
                     payload_status=payload_status,
+                    timestamp=t_gui,
+                    cri_rtt_ms=self.manager.robot.network_latency.statistics.latest_ms,
+                    estimated_one_way_ms=self.manager.robot.network_latency.estimated_one_way_ms,
+                    rtt_jitter_ms=self.manager.robot.network_latency.statistics.peak_consecutive_jitter_ms,
+                    rtt_mean_ms=self.manager.robot.network_latency.statistics.mean_ms,
+                    rtt_std_ms=self.manager.robot.network_latency.statistics.standard_deviation_ms,
+                    rtt_p95_ms=self.manager.robot.network_latency.statistics.p95_ms,
+                    rtt_p99_ms=self.manager.robot.network_latency.statistics.p99_ms,
+                    command_id=motion_response.command_id if motion_response else None,
+                    joint_index=motion_response.joint_index if motion_response else None,
+                    gui_to_motion_ms=(
+                        motion_response.gui_to_motion_ms if motion_response else None
+                    ),
+                    tx_to_motion_ms=(
+                        motion_response.tx_to_motion_ms if motion_response else None
+                    ),
                 ))
+        # Legacy metric: elapsed local processing time inside one GUI analytics
+        # update. This is NOT CRI network RTT and NOT physical execution latency.
+        return (time.perf_counter() - processing_started) * 1000.0
 
     def connect_robot(self):
         if self.manager.connect(self.ip_input.text().strip()):
@@ -1122,8 +1186,12 @@ class MainWindow(QMainWindow):
             self.real_view.toggle_trail(self.chk_real_time_trail.isChecked())
             # Register status callback so STATUS updates can be handled cleanly
             self.manager.robot.register_status_callback(self._on_robot_status_update)
+            self.manager.robot.register_command_sent_callback(self._on_command_sent)
         else:
-            QMessageBox.critical(self, "Error", "Failed to connect to physical robot.")
+            reason = self.manager.last_connection_error or (
+                "The CRI controller did not complete the connection sequence."
+            )
+            QMessageBox.critical(self, "Robot Connection Failed", reason)
 
     def disconnect_robot(self):
         self.manager.disconnect()
@@ -1144,10 +1212,38 @@ class MainWindow(QMainWindow):
         self.lbl_total_current.setText("Total Joint Current: -- mA")
         self.lbl_power.setText("Power: -- W")
 
-    def _on_robot_status_update(self, state):
+    def _on_command_sent(self, command_id, command, t_tx):
+        with self._motion_request_lock:
+            request = self._pending_motion_request
+            if request is None or request["kind"] not in command:
+                return
+            self._pending_motion_request = None
+        self.execution_latency.start_command(
+            command_id,
+            t_gui=request["t_gui"],
+            t_tx=t_tx,
+            joint_index=request["joint_index"],
+            direction=request["direction"],
+            commanded_speed=request["commanded_speed"],
+            target_velocity_deg_s=request["target_velocity_deg_s"],
+        )
+
+    def _on_robot_status_update(self, state, t_rx=None):
         # No direct UI updates here because this callback runs in the receive thread.
-        # The main UI timer polls the latest robot state and updates labels safely.
-        return
+        # The tracker uses STATUS packet timing, not the slower GUI timer.
+        with self.manager.robot.robot_state_lock:
+            positions = [
+                state.joints_current.A1,
+                state.joints_current.A2,
+                state.joints_current.A3,
+                state.joints_current.A4,
+                state.joints_current.A5,
+                state.joints_current.A6,
+            ]
+        responses = self.execution_latency.update_telemetry(positions, t_rx)
+        if responses:
+            with self._motion_request_lock:
+                self._latest_motion_response = responses[-1]
 
     def move_to_start(self):
         """Move the robot to the first target in the planned path."""
@@ -1173,6 +1269,22 @@ class MainWindow(QMainWindow):
             self.move_to_start_complete = False
             self.move_to_start_error = None
             self.move_to_start_target = start_angles
+            current_angles = self.manager.get_joint_angles_list()
+            direction_index = max(
+                range(6),
+                key=lambda index: abs(start_angles[index] - current_angles[index]),
+            )
+            direction = start_angles[direction_index] - current_angles[direction_index]
+            if direction != 0.0:
+                with self._motion_request_lock:
+                    self._pending_motion_request = {
+                        "t_gui": time.perf_counter(),
+                        "joint_index": direction_index,
+                        "direction": direction,
+                        "commanded_speed": velocity,
+                        "target_velocity_deg_s": None,
+                        "kind": "CMD Move Joint",
+                    }
 
             self.move_to_start_thread = threading.Thread(
                 target=self._move_to_start_worker,
@@ -1262,7 +1374,7 @@ class MainWindow(QMainWindow):
             self.btn_execute_path.setEnabled(True)
 
     def _execute_path_worker(self, path_data, velocity):
-        self.log_start_time = time.time()
+        self.log_start_time = time.perf_counter()
         self.is_recording_diagnostics = True
         self.realtime_data_log.append(
             self._build_diagnostics_record(
@@ -1328,10 +1440,24 @@ class MainWindow(QMainWindow):
             )
             self._update_execution_metrics(time.monotonic(), power_w)
 
-            self._run_digital_twin_analytics(real_joints, real_currents)
+            processing_time_ms = self._run_digital_twin_analytics(real_joints, real_currents)
+            network = self.manager.robot.network_latency
+            with self._motion_request_lock:
+                motion_response = self._latest_motion_response
+            self.latency_panel.update_values(
+                rtt_ms=network.statistics.latest_ms,
+                one_way_ms=network.estimated_one_way_ms,
+                jitter_ms=network.statistics.peak_consecutive_jitter_ms,
+                gui_to_motion_ms=(
+                    motion_response.gui_to_motion_ms if motion_response else None
+                ),
+                tx_to_motion_ms=(
+                    motion_response.tx_to_motion_ms if motion_response else None
+                ),
+            )
 
             if self.is_recording_diagnostics:
-                record_time = time.time() - self.log_start_time
+                record_time = time.perf_counter() - self.log_start_time
                 self.realtime_data_log.append(
                     self._build_diagnostics_record(record_time, real_joints, real_currents)
                 )
@@ -1415,7 +1541,7 @@ class MainWindow(QMainWindow):
             self.manager.current_jog_speeds[key] = 0.0
             
         if Qt.Key.Key_I not in self.pressed_keys:
-            self.manager.stop_jog()
+            self.stop_jog_with_realtime()
             return
             
         speed = 15

@@ -11,6 +11,7 @@ class RebelManager:
 
     def __init__(self):
         self.robot = CRIController()
+        self.last_connection_error: str | None = None
         self.current_jog_speeds = {
             "A1": 0.0, "A2": 0.0, "A3": 0.0, "A4": 0.0, "A5": 0.0, "A6": 0.0,
             "E1": 0.0, "E2": 0.0, "E3": 0.0
@@ -18,11 +19,20 @@ class RebelManager:
 
     def connect(self, ip_address):
         """Creates a fresh controller and connects to the iRC TCP socket."""
+        self.last_connection_error = None
         self.robot = CRIController()
         if not self.robot.connect(ip_address, 3920):
+            self.last_connection_error = (
+                f"CRI TCP connection failed for {ip_address}:3920. "
+                "Check the robot IP, network cable, and iRC CRI server."
+            )
             return False
 
         if not self.robot.set_active_control(True):
+            self.last_connection_error = (
+                "TCP connected, but the robot rejected active control. "
+                "Close other CRI clients and verify the robot is ready for external control."
+            )
             try:
                 self.robot.close()
             except Exception:
