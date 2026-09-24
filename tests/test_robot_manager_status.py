@@ -2,6 +2,7 @@ import unittest
 from threading import Lock
 
 from cri_lib.cri_protocol_parser import CRIProtocolParser
+from cri_lib.cri_controller import CRIController
 from cri_lib.robot_state import RobotState
 from hardware.robot_manager import RebelManager
 
@@ -42,6 +43,19 @@ class RebelManagerStatusTest(unittest.TestCase):
         self.assertIn("SUPPLY", robot_state.status_fields_seen)
         self.assertIn("CURRENTALL", robot_state.status_fields_seen)
         self.assertIn("CURRENTJOINTS", robot_state.status_fields_seen)
+
+    def test_status_callback_receives_socket_timestamp_and_is_isolated(self) -> None:
+        controller = CRIController()
+        callback_times = []
+
+        def callback(_state, received_at):
+            callback_times.append(received_at)
+            raise RuntimeError("observer failure must not escape receive processing")
+
+        controller.register_status_callback(callback)
+        controller._parse_message("CRISTART 1 STATUS CRIEND", t_rx=12.5)
+
+        self.assertEqual(callback_times, [12.5])
 
 
 if __name__ == "__main__":

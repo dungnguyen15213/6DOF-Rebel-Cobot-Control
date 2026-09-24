@@ -762,6 +762,7 @@ class MainWindow(QMainWindow):
     def stop_jog_with_realtime(self):
         with self._motion_request_lock:
             self._pending_motion_request = None
+        self.execution_latency.cancel_pending()
         self.manager.stop_jog()
 
     def _reset_trails(self):
@@ -1194,6 +1195,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Robot Connection Failed", reason)
 
     def disconnect_robot(self):
+        self.execution_latency.cancel_pending()
         self.manager.disconnect()
         self._reset_trails()
         self._reset_execution_metrics()
@@ -1215,7 +1217,7 @@ class MainWindow(QMainWindow):
     def _on_command_sent(self, command_id, command, t_tx):
         with self._motion_request_lock:
             request = self._pending_motion_request
-            if request is None or request["kind"] not in command:
+            if request is None or not self._matches_motion_request(command, request):
                 return
             self._pending_motion_request = None
         self.execution_latency.start_command(
@@ -1227,6 +1229,17 @@ class MainWindow(QMainWindow):
             commanded_speed=request["commanded_speed"],
             target_velocity_deg_s=request["target_velocity_deg_s"],
         )
+
+    @staticmethod
+    def _matches_motion_request(command, request):
+        if request["kind"] != "ALIVEJOG" or not command.startswith("ALIVEJOG "):
+            return False
+        try:
+            speeds = [float(value) for value in command.split()[1:]]
+            selected_speed = speeds[request["joint_index"]]
+        except (IndexError, ValueError):
+            return False
+        return selected_speed != 0.0 and selected_speed * request["direction"] > 0.0
 
     def _on_robot_status_update(self, state, t_rx=None):
         # No direct UI updates here because this callback runs in the receive thread.
@@ -1442,18 +1455,25 @@ class MainWindow(QMainWindow):
 
             processing_time_ms = self._run_digital_twin_analytics(real_joints, real_currents)
             network = self.manager.robot.network_latency
+            now = time.perf_counter()
+            network.expire_pending(now)
+            self.execution_latency.expire_pending(now)
             with self._motion_request_lock:
                 motion_response = self._latest_motion_response
             self.latency_panel.update_values(
                 rtt_ms=network.statistics.latest_ms,
                 one_way_ms=network.estimated_one_way_ms,
                 jitter_ms=network.statistics.peak_consecutive_jitter_ms,
+                mean_ms=network.statistics.mean_ms,
+                std_ms=network.statistics.std_ms,
                 gui_to_motion_ms=(
                     motion_response.gui_to_motion_ms if motion_response else None
                 ),
                 tx_to_motion_ms=(
                     motion_response.tx_to_motion_ms if motion_response else None
                 ),
+                gui_to_tx_ms=(motion_response.gui_to_tx_ms if motion_response else None),
+                status=self.execution_latency.latest_status,
             )
 
             if self.is_recording_diagnostics:

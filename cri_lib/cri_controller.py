@@ -65,7 +65,7 @@ class CRIController:
         self.network_latency = NetworkLatencyTracker()
         self.command_sent_callback: Callable[[str, str, float], None] | None = None
 
-        self.status_callback: Callable | None = None
+        self.status_callback: Callable[[RobotState, float], None] | None = None
 
         self.live_jog_active: bool = False
         self.jog_intervall = self.ALIVE_JOG_INTERVAL_SEC
@@ -214,7 +214,8 @@ class CRIController:
         try:
             with self.socket_write_lock:
                 t_tx = perf_counter()
-                self.network_latency.record_sent(str(command_counter), t_tx)
+                if register_answer and fixed_answer_name is None:
+                    self.network_latency.record_sent(str(command_counter), t_tx)
                 self.sock.sendall(message.encode())
             if self.command_sent_callback is not None:
                 try:
@@ -267,6 +268,7 @@ class CRIController:
         while self.connected:
             try:
                 recv_buffer = self.sock.recv(4096)
+                socket_received_at = perf_counter()
             except TimeoutError:
                 continue
 
@@ -287,8 +289,7 @@ class CRIController:
                     # check if there is a complete message
                     if start_idx != -1:
                         message = message_buffer[start_idx : end_idx + 6].decode()
-                        t_rx = perf_counter()
-                        self._parse_message(message, t_rx)
+                        self._parse_message(message, socket_received_at)
 
                     # check if there is data left in the buffer
                     if len(message_buffer) > end_idx + 7:
@@ -361,7 +362,10 @@ class CRIController:
         if (notification := self.parser.parse_message(message)) is not None:
             answer_id = notification["answer"]
             if answer_id == "status" and self.status_callback is not None:
-                self.status_callback(self.robot_state, received_at)
+                try:
+                    self.status_callback(self.robot_state, received_at)
+                except Exception:
+                    logger.exception("Status callback failed")
 
             if isinstance(answer_id, str) and answer_id.isdigit():
                 self.network_latency.record_received(answer_id, received_at)
@@ -394,10 +398,12 @@ class CRIController:
         self._register_answer("status")
         self._wait_for_answer("status", timeout)
 
-    def register_status_callback(self, callback: Callable | None) -> None:
+    def register_status_callback(
+        self, callback: Callable[[RobotState, float], None] | None
+    ) -> None:
         """Register a callback which is called every time a STATUS message was parsed to the state.
         The callback must have the following definition:
-        def callback(state: RobotState)
+        def callback(state: RobotState, received_at: float)
         Keep the callback as fast as possible as it will be excute by the receive thread and no messages will be processed, while is runs.
         Also keep thread safety in mind, as the callback will be excuted by the receive thread.
 

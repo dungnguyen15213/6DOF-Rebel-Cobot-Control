@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 import statistics
 import threading
 import time
@@ -30,6 +31,11 @@ class LatencyStatistics:
             return list(self._samples)
 
     @property
+    def count(self) -> int:
+        with self._lock:
+            return len(self._samples)
+
+    @property
     def latest_ms(self) -> float | None:
         with self._lock:
             return self._samples[-1] if self._samples else None
@@ -43,6 +49,10 @@ class LatencyStatistics:
     def standard_deviation_ms(self) -> float | None:
         samples = self._snapshot()
         return statistics.stdev(samples) if len(samples) >= 2 else None
+
+    @property
+    def std_ms(self) -> float | None:
+        return self.standard_deviation_ms
 
     @property
     def median_ms(self) -> float | None:
@@ -77,9 +87,17 @@ class LatencyStatistics:
         return min(samples) if samples else None
 
     @property
+    def min_ms(self) -> float | None:
+        return self.minimum_ms
+
+    @property
     def maximum_ms(self) -> float | None:
         samples = self._snapshot()
         return max(samples) if samples else None
+
+    @property
+    def max_ms(self) -> float | None:
+        return self.maximum_ms
 
     @property
     def peak_consecutive_jitter_ms(self) -> float | None:
@@ -88,29 +106,52 @@ class LatencyStatistics:
             return None
         return max(abs(current - previous) for previous, current in zip(samples, samples[1:]))
 
+    @property
+    def peak_jitter_ms(self) -> float | None:
+        return self.peak_consecutive_jitter_ms
+
 
 class NetworkLatencyTracker:
     """Measures CRI command-to-ACK round-trip time using a monotonic clock."""
 
-    def __init__(self, max_samples: int = 1000) -> None:
+    def __init__(self, max_samples: int = 1000, pending_ttl_s: float = 10.0) -> None:
         self.statistics = LatencyStatistics(max_samples)
         self._max_pending = max_samples
+        self.pending_ttl_s = pending_ttl_s
         self._pending: dict[str, float] = {}
         self._lock = threading.RLock()
 
     def record_sent(self, command_id: str, timestamp: float | None = None) -> None:
         sent_at = time.perf_counter() if timestamp is None else timestamp
         with self._lock:
+            self._expire_pending_locked(sent_at)
             if len(self._pending) >= self._max_pending:
                 oldest_id = next(iter(self._pending))
                 del self._pending[oldest_id]
             self._pending[str(command_id)] = sent_at
+
+    def expire_pending(self, timestamp: float | None = None) -> int:
+        """Remove unmatched command IDs older than the configured TTL."""
+        now = time.perf_counter() if timestamp is None else timestamp
+        with self._lock:
+            return self._expire_pending_locked(now)
+
+    def _expire_pending_locked(self, now: float) -> int:
+        stale_ids = [
+            command_id
+            for command_id, sent_at in self._pending.items()
+            if now - sent_at > self.pending_ttl_s
+        ]
+        for command_id in stale_ids:
+            del self._pending[command_id]
+        return len(stale_ids)
 
     def record_received(
         self, command_id: str, timestamp: float | None = None
     ) -> float | None:
         received_at = time.perf_counter() if timestamp is None else timestamp
         with self._lock:
+            self._expire_pending_locked(received_at)
             sent_at = self._pending.pop(str(command_id), None)
         if sent_at is None:
             return None
@@ -129,6 +170,14 @@ class NetworkLatencyTracker:
         return latest / 2.0 if latest is not None else None
 
 
+class MeasurementStatus(str, Enum):
+    PENDING = "PENDING"
+    DETECTED = "DETECTED"
+    TIMEOUT = "TIMEOUT"
+    INVALID_ALREADY_MOVING = "INVALID_ALREADY_MOVING"
+    CANCELLED = "CANCELLED"
+
+
 @dataclass(frozen=True)
 class MotionResponse:
     """A telemetry-observed motion-onset measurement."""
@@ -137,6 +186,10 @@ class MotionResponse:
     joint_index: int
     gui_to_motion_ms: float
     tx_to_motion_ms: float | None
+    gui_to_tx_ms: float | None
+    motion_threshold_deg_s: float
+    stationary_velocity_std_deg_s: float
+    status: MeasurementStatus = MeasurementStatus.DETECTED
 
 
 @dataclass
@@ -149,6 +202,9 @@ class _MotionCommand:
     commanded_speed: float | None
     target_velocity_deg_s: float | None
     consecutive_motion_samples: int = 0
+    candidate_motion_time: float | None = None
+    timeout_at: float | None = None
+    status: MeasurementStatus = MeasurementStatus.PENDING
 
 
 class ExecutionLatencyTracker:
@@ -166,6 +222,8 @@ class ExecutionLatencyTracker:
         noise_multiplier: float = 3.0,
         required_consecutive_samples: int = 2,
         stationary_velocity_std_deg_s: float = 0.0,
+        motion_timeout_s: float = 3.0,
+        stationary_band_deg_s: float = 0.5,
     ) -> None:
         if required_consecutive_samples < 1:
             raise ValueError("required_consecutive_samples must be positive")
@@ -173,11 +231,18 @@ class ExecutionLatencyTracker:
         self.noise_multiplier = noise_multiplier
         self.required_consecutive_samples = required_consecutive_samples
         self.stationary_velocity_std_deg_s = stationary_velocity_std_deg_s
+        self.motion_timeout_s = motion_timeout_s
+        self.stationary_band_deg_s = stationary_band_deg_s
         self.responses: Deque[MotionResponse] = deque(maxlen=max_samples)
         self.statistics = LatencyStatistics(max_samples)
         self._pending: dict[str, _MotionCommand] = {}
         self._previous_positions: list[float] | None = None
         self._previous_timestamp: float | None = None
+        self._previous_velocities = [0.0] * 6
+        self._stationary_velocities: list[Deque[float]] = [
+            deque(maxlen=max_samples) for _ in range(6)
+        ]
+        self._last_status: MeasurementStatus | None = None
         self._lock = threading.RLock()
 
     def start_command(
@@ -189,21 +254,58 @@ class ExecutionLatencyTracker:
         commanded_speed: float | None = None,
         target_velocity_deg_s: float | None = None,
         t_tx: float | None = None,
+        timeout_s: float | None = None,
     ) -> None:
         if not 0 <= joint_index < 6:
             raise ValueError("joint_index must be between 0 and 5")
         if direction == 0.0:
             raise ValueError("direction must be positive or negative")
         with self._lock:
+            if abs(self._previous_velocities[joint_index]) >= self._threshold(joint_index):
+                self._last_status = MeasurementStatus.INVALID_ALREADY_MOVING
+                return
+            self._pending.clear()
+            started_at = time.perf_counter() if t_gui is None else t_gui
             self._pending[str(command_id)] = _MotionCommand(
                 command_id=str(command_id),
-                t_gui=time.perf_counter() if t_gui is None else t_gui,
+                t_gui=started_at,
                 t_tx=t_tx,
                 joint_index=joint_index,
                 direction=1.0 if direction > 0.0 else -1.0,
                 commanded_speed=commanded_speed,
                 target_velocity_deg_s=target_velocity_deg_s,
+                timeout_at=started_at + (self.motion_timeout_s if timeout_s is None else timeout_s),
             )
+
+    def cancel_pending(self, status: MeasurementStatus = MeasurementStatus.CANCELLED) -> None:
+        with self._lock:
+            self._pending.clear()
+            self._last_status = status
+
+    def expire_pending(self, timestamp: float | None = None) -> bool:
+        """Mark an unobserved active trial as timed out without waiting for STATUS."""
+        now = time.perf_counter() if timestamp is None else timestamp
+        with self._lock:
+            timed_out = any(
+                command.timeout_at is not None and now >= command.timeout_at
+                for command in self._pending.values()
+            )
+            if timed_out:
+                self._pending.clear()
+                self._last_status = MeasurementStatus.TIMEOUT
+            return timed_out
+
+    def get_stationary_velocity_std(self, joint_index: int) -> float | None:
+        with self._lock:
+            samples = list(self._stationary_velocities[joint_index])
+        return statistics.stdev(samples) if len(samples) >= 2 else None
+
+    def _threshold(self, joint_index: int) -> float:
+        noise_std = self.get_stationary_velocity_std(joint_index)
+        return max(
+            self.minimum_velocity_deg_s,
+            self.noise_multiplier * (noise_std if noise_std is not None else self.stationary_velocity_std_deg_s),
+        )
 
     def record_transmission(self, command_id: str, timestamp: float | None = None) -> None:
         with self._lock:
@@ -234,12 +336,18 @@ class ExecutionLatencyTracker:
             ]
             self._previous_positions = current
             self._previous_timestamp = now
-            threshold = max(
-                self.minimum_velocity_deg_s,
-                self.noise_multiplier * self.stationary_velocity_std_deg_s,
-            )
+            self._previous_velocities = velocities
+            if not self._pending:
+                for index, velocity in enumerate(velocities):
+                    if abs(velocity) <= self.stationary_band_deg_s:
+                        self._stationary_velocities[index].append(velocity)
             detected: list[MotionResponse] = []
             for command_id, command in list(self._pending.items()):
+                if command.timeout_at is not None and now >= command.timeout_at:
+                    self._last_status = MeasurementStatus.TIMEOUT
+                    del self._pending[command_id]
+                    continue
+                threshold = self._threshold(command.joint_index)
                 velocity = velocities[command.joint_index]
                 direction_matches = velocity * command.direction > 0.0
                 threshold_exceeded = abs(velocity) >= threshold
@@ -248,21 +356,28 @@ class ExecutionLatencyTracker:
                         threshold, 0.05 * abs(command.target_velocity_deg_s)
                     )
                 if direction_matches and threshold_exceeded:
+                    if command.consecutive_motion_samples == 0:
+                        command.candidate_motion_time = now
                     command.consecutive_motion_samples += 1
                 else:
                     command.consecutive_motion_samples = 0
+                    command.candidate_motion_time = None
                 if command.consecutive_motion_samples < self.required_consecutive_samples:
                     continue
                 response = MotionResponse(
                     command_id=command_id,
                     joint_index=command.joint_index,
-                    gui_to_motion_ms=(now - command.t_gui) * 1000.0,
-                    tx_to_motion_ms=(now - command.t_tx) * 1000.0
+                    gui_to_motion_ms=((command.candidate_motion_time or now) - command.t_gui) * 1000.0,
+                    tx_to_motion_ms=((command.candidate_motion_time or now) - command.t_tx) * 1000.0
                     if command.t_tx is not None
                     else None,
+                    gui_to_tx_ms=(command.t_tx - command.t_gui) * 1000.0 if command.t_tx is not None else None,
+                    motion_threshold_deg_s=threshold,
+                    stationary_velocity_std_deg_s=self.get_stationary_velocity_std(command.joint_index) or 0.0,
                 )
                 self.responses.append(response)
                 self.statistics.add(response.gui_to_motion_ms)
+                self._last_status = MeasurementStatus.DETECTED
                 detected.append(response)
                 del self._pending[command_id]
             return tuple(detected)
@@ -271,3 +386,8 @@ class ExecutionLatencyTracker:
     def latest_response(self) -> MotionResponse | None:
         with self._lock:
             return self.responses[-1] if self.responses else None
+
+    @property
+    def latest_status(self) -> MeasurementStatus | None:
+        with self._lock:
+            return self._last_status
