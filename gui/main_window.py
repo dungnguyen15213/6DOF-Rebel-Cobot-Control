@@ -18,6 +18,7 @@ from core.kinematics import ReBelKinematics
 from core.digital_twin_analytics import (
     AdaptiveBaselineRLS, CUSUMDetector, PayloadEstimator, TelemetryLogger, TelemetryRecord,
 )
+from core.identification_logger import IdentificationLogger
 from core.latency_tracking import ExecutionLatencyTracker
 from core.latency_experiment_logger import LatencyExperimentLogger
 from hardware.robot_manager import RebelManager
@@ -113,6 +114,10 @@ class MainWindow(QMainWindow):
         self.execution_last_sample_time = None
         self.execution_last_power_w = None
         self.execution_stop_event = threading.Event()
+        self.identification_logger = None
+        self._identification_last_timestamp = None
+        self._identification_last_q = None
+        self._identification_last_qdot = None
         self.move_to_start_thread = None
         self.move_to_start_complete = False
         self.move_to_start_error = None
@@ -609,6 +614,47 @@ class MainWindow(QMainWindow):
         robot_control_layout.addWidget(self.btn_execute_path)
         
         execution_layout.addLayout(robot_control_layout)
+
+        identification_group = QGroupBox("Identification Recording")
+        identification_layout = QGridLayout()
+        identification_layout.setHorizontalSpacing(6)
+        identification_layout.setVerticalSpacing(6)
+
+        self.le_experiment_id = QLineEdit("ID_NORMAL_001")
+        self.le_trajectory_id = QLineEdit("JOINT2_SWEEP_MEDIUM")
+        self.le_run_id = QLineEdit("RUN_01")
+        self.spin_payload_g = QDoubleSpinBox()
+        self.spin_payload_g.setRange(0.0, 10000.0)
+        self.spin_payload_g.setValue(0.0)
+        self.spin_payload_g.setSuffix(" g")
+        self.combo_contact_label = QComboBox()
+        self.combo_contact_label.addItems(["NORMAL", "CONTACT", "COLLISION", "UNKNOWN"])
+        self.combo_grasp_context = QComboBox()
+        self.combo_grasp_context.addItems(["NONE", "FALSE", "TRUE"])
+        self.combo_thermal_condition = QComboBox()
+        self.combo_thermal_condition.addItems(["COLD", "WARM"])
+
+        for label_text, widget in [
+            ("Experiment ID:", self.le_experiment_id),
+            ("Trajectory ID:", self.le_trajectory_id),
+            ("Run ID:", self.le_run_id),
+            ("Payload (g):", self.spin_payload_g),
+            ("Contact label:", self.combo_contact_label),
+            ("Grasp context:", self.combo_grasp_context),
+            ("Thermal condition:", self.combo_thermal_condition),
+        ]:
+            identification_layout.addWidget(QLabel(label_text), identification_layout.rowCount(), 0)
+            identification_layout.addWidget(widget, identification_layout.rowCount() - 1, 1)
+
+        self.btn_start_identification = QPushButton("Start Identification Run")
+        self.btn_stop_identification = QPushButton("Stop & Save Run")
+        self.btn_stop_identification.setEnabled(False)
+        self.btn_start_identification.clicked.connect(self.start_identification_recording)
+        self.btn_stop_identification.clicked.connect(self.stop_identification_recording)
+        identification_layout.addWidget(self.btn_start_identification, identification_layout.rowCount(), 0)
+        identification_layout.addWidget(self.btn_stop_identification, identification_layout.rowCount() - 1, 1)
+        identification_group.setLayout(identification_layout)
+        execution_layout.addWidget(identification_group)
         execution_layout.addStretch()
 
         execution_scroll = QScrollArea()
@@ -698,6 +744,67 @@ class MainWindow(QMainWindow):
 
     def _execution_motion_speed(self):
         return float(self.spin_robot_velocity.value())
+
+    def _get_identification_metadata(self):
+        return {
+            "experiment_id": self.le_experiment_id.text().strip() or "ID_NORMAL_001",
+            "trajectory_id": self.le_trajectory_id.text().strip() or "UNSPECIFIED_TRAJECTORY",
+            "run_id": self.le_run_id.text().strip() or "RUN_01",
+            "commanded_speed": float(self.spin_robot_velocity.value()),
+            "payload_g": float(self.spin_payload_g.value()),
+            "contact_label": self.combo_contact_label.currentText(),
+            "grasp_context": self.combo_grasp_context.currentText(),
+            "thermal_condition": self.combo_thermal_condition.currentText(),
+        }
+
+    def start_identification_recording(self):
+        if not self.manager.robot.connected:
+            QMessageBox.warning(self, "Not Connected", "Connect to the robot before starting an identification run.")
+            return
+
+        if self.identification_logger is not None:
+            self.stop_identification_recording()
+
+        metadata = self._get_identification_metadata()
+        self.identification_logger = IdentificationLogger(
+            output_dir="identification_data",
+            experiment_id=metadata["experiment_id"],
+            trajectory_id=metadata["trajectory_id"],
+            run_id=metadata["run_id"],
+            commanded_speed=metadata["commanded_speed"],
+            payload_g=metadata["payload_g"],
+            contact_label=metadata["contact_label"],
+            grasp_context=metadata["grasp_context"],
+            thermal_condition=metadata["thermal_condition"],
+            overwrite=False,
+        )
+        self._identification_last_timestamp = None
+        self._identification_last_q = None
+        self._identification_last_qdot = None
+        self.btn_start_identification.setEnabled(False)
+        self.btn_stop_identification.setEnabled(True)
+        self.lbl_execution.setText("Execution: Recording identification data")
+        QMessageBox.information(
+            self,
+            "Identification Recording Started",
+            f"Writing raw telemetry to:\n{self.identification_logger.file_path}",
+        )
+
+    def stop_identification_recording(self):
+        if self.identification_logger is None:
+            self.btn_start_identification.setEnabled(True)
+            self.btn_stop_identification.setEnabled(False)
+            return
+
+        self.identification_logger.close()
+        self.identification_logger = None
+        self._identification_last_timestamp = None
+        self._identification_last_q = None
+        self._identification_last_qdot = None
+        self.btn_start_identification.setEnabled(True)
+        self.btn_stop_identification.setEnabled(False)
+        self.lbl_execution.setText("Execution: Idle")
+        QMessageBox.information(self, "Identification Run Saved", "The identification run was closed and saved.")
 
     def _reset_execution_metrics(self):
         self.execution_session_active = False
@@ -1219,6 +1326,9 @@ class MainWindow(QMainWindow):
         if self.telemetry_logger is not None:
             self.telemetry_logger.close()
             self.telemetry_logger = None
+        if self.identification_logger is not None:
+            self.identification_logger.close()
+            self.identification_logger = None
         self.status_label.setText("Status: Disconnected ❌")
         self.status_label.setStyleSheet("font-weight: bold; color: red;")
         self.btn_connect.setEnabled(True)
@@ -1238,6 +1348,9 @@ class MainWindow(QMainWindow):
         if self.telemetry_logger is not None:
             self.telemetry_logger.close()
             self.telemetry_logger = None
+        if self.identification_logger is not None:
+            self.identification_logger.close()
+            self.identification_logger = None
         self.latency_experiment_logger.close()
         super().closeEvent(event)
 
@@ -1286,6 +1399,42 @@ class MainWindow(QMainWindow):
                 state.joints_current.A6,
             ]
         self.execution_latency.update_telemetry(positions, t_rx)
+
+        if self.identification_logger is None:
+            return
+
+        current_ts = float(t_rx if t_rx is not None else time.perf_counter())
+        q = list(positions)
+        currents = [
+            float(current)
+            for current in (list(state.current_joints[:6]) if len(state.current_joints) >= 6 else [0.0] * 6)
+        ]
+        qdot = [0.0] * 6
+        qddot = [0.0] * 6
+        if self._identification_last_timestamp is not None and self._identification_last_q is not None:
+            dt = current_ts - self._identification_last_timestamp
+            if dt > 0.0:
+                qdot = [
+                    (q[idx] - self._identification_last_q[idx]) / dt
+                    for idx in range(6)
+                ]
+                if self._identification_last_qdot is not None:
+                    qddot = [
+                        (qdot[idx] - self._identification_last_qdot[idx]) / dt
+                        for idx in range(6)
+                    ]
+
+        self.identification_logger.log_sample(
+            timestamp=current_ts,
+            q=q,
+            qdot=qdot,
+            current=currents,
+            qddot=qddot,
+            metadata=self._get_identification_metadata(),
+        )
+        self._identification_last_timestamp = current_ts
+        self._identification_last_q = q
+        self._identification_last_qdot = qdot
 
     def move_to_start(self):
         """Move the robot to the first target in the planned path."""
