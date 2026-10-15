@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 
+import csv
 import sys
 from pathlib import Path
 
-from core.identification_logger import analyze_identification_csv
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+from core.identification_logger import _print_report, analyze_identification_csv
 
 
 def main() -> int:
@@ -16,27 +21,13 @@ def main() -> int:
         print(f"CSV file not found: {csv_path}")
         return 1
 
-    report = analyze_identification_csv(csv_path)
-    print("Identification CSV quality summary")
-    print("=" * 36)
-    print(f"total_rows: {report['total_rows']}")
-    print(f"start_timestamp: {report['first_timestamp']}")
-    print(f"end_timestamp: {report['last_timestamp']}")
-    print(f"monotonic: {report['monotonic']}")
-    print(f"duplicate_timestamps: {report['duplicate_timestamps']}")
-    print(f"invalid_dt_values: {report['invalid_dt_values']}")
-    print(f"dt_min: {report['dt_min']}")
-    print(f"dt_max: {report['dt_max']}")
-    print(f"dt_mean: {report['dt_mean']}")
-    print(f"dt_median: {report['dt_median']}")
-    print(f"dt_percentiles: {report['dt_percentiles']}")
-    print(f"missing_values: {report['missing_values']}")
-    print(f"experiment_id_values: {report['experiment_id_values']}")
-    print(f"trajectory_id_values: {report['trajectory_id_values']}")
-    print(f"run_id_values: {report['run_id_values']}")
-    print(f"current_limit_verified: {report['current_limit_verified']}")
-    print(f"schema_summary: {report['schema_summary']}")
-    return 0
+    try:
+        report = analyze_identification_csv(csv_path)
+    except (OSError, UnicodeError, csv.Error) as exc:
+        print(f"FAIL: {csv_path} is unreadable or corrupt: {exc}")
+        return 2
+    _print_report(report)
+    return 2 if report["quality_status"] == "FAIL" else 0
 
 
 if __name__ == "__main__":

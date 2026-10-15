@@ -2,9 +2,11 @@ import json
 import os
 import time
 import threading
+from pathlib import Path
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QGroupBox, QLabel, QPushButton, QLineEdit, QMessageBox,
-                             QComboBox, QDoubleSpinBox, QDialog, QSpinBox, QFileDialog, QSlider, QScrollArea, QTabWidget, QCheckBox) 
+                             QComboBox, QDoubleSpinBox, QDialog, QSpinBox, QFileDialog, QSlider, QScrollArea, QTabWidget, QCheckBox,
+                             QFormLayout, QDialogButtonBox)
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QSplitter
 import numpy as np
@@ -18,7 +20,10 @@ from core.kinematics import ReBelKinematics
 from core.digital_twin_analytics import (
     AdaptiveBaselineRLS, CUSUMDetector, PayloadEstimator, TelemetryLogger, TelemetryRecord,
 )
-from core.identification_logger import IdentificationLogger
+from core.identification_logger import (
+    IdentificationLogger,
+    find_existing_identification_run,
+)
 from core.latency_tracking import ExecutionLatencyTracker
 from core.latency_experiment_logger import LatencyExperimentLogger
 from hardware.robot_manager import RebelManager
@@ -73,12 +78,75 @@ class HomingConfigDialog(QDialog):
         }
 
 
+class IdentificationSettingsDialog(QDialog):
+    """Edit metadata that will be attached to the next experiment run."""
+
+    def __init__(self, values, trajectory_id, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Identification Settings")
+        self.setModal(True)
+        layout = QFormLayout(self)
+
+        self.experiment_id = QLineEdit(values.get("experiment_id", "ID_NORMAL_001"))
+        self.trajectory_id = QLineEdit(values.get("trajectory_id", trajectory_id))
+        self.trajectory_id.setPlaceholderText(trajectory_id)
+        self.run_id = QLineEdit(values.get("run_id", "RUN_01"))
+        self.commanded_speed = QDoubleSpinBox()
+        self.commanded_speed.setRange(1.0, 100.0)
+        self.commanded_speed.setDecimals(0)
+        self.commanded_speed.setSuffix(" %")
+        self.commanded_speed.setValue(float(values.get("commanded_speed", 50.0)))
+        self.payload_g = QDoubleSpinBox()
+        self.payload_g.setRange(0.0, 10000.0)
+        self.payload_g.setSuffix(" g")
+        self.payload_g.setValue(float(values.get("payload_g", 0.0)))
+        self.contact_label = QComboBox()
+        self.contact_label.addItems(["NORMAL", "CONTACT", "COLLISION", "UNKNOWN"])
+        self.contact_label.setCurrentText(values.get("contact_label", "NORMAL"))
+        self.grasp_context = QComboBox()
+        self.grasp_context.addItems(["NONE", "FALSE", "TRUE"])
+        self.grasp_context.setCurrentText(values.get("grasp_context", "NONE"))
+        self.thermal_condition = QComboBox()
+        self.thermal_condition.addItems(["COLD", "WARM"])
+        self.thermal_condition.setCurrentText(values.get("thermal_condition", "COLD"))
+
+        layout.addRow("Experiment ID", self.experiment_id)
+        layout.addRow("Trajectory ID (blank = filename)", self.trajectory_id)
+        layout.addRow("Run ID", self.run_id)
+        layout.addRow("Commanded speed", self.commanded_speed)
+        layout.addRow("Payload", self.payload_g)
+        layout.addRow("Contact label", self.contact_label)
+        layout.addRow("Grasp context", self.grasp_context)
+        layout.addRow("Thermal condition", self.thermal_condition)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addRow(buttons)
+
+    def get_values(self):
+        return {
+            "experiment_id": self.experiment_id.text().strip() or "ID_NORMAL_001",
+            "trajectory_id": self.trajectory_id.text().strip(),
+            "run_id": self.run_id.text().strip() or "RUN_01",
+            "commanded_speed": float(self.commanded_speed.value()),
+            "payload_g": float(self.payload_g.value()),
+            "contact_label": self.contact_label.currentText(),
+            "grasp_context": self.grasp_context.currentText(),
+            "thermal_condition": self.thermal_condition.currentText(),
+        }
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
         self.path_planner = PathPlanner()
         self.path_executor = PathExecutor()
+        self.loaded_trajectory_path = None
+        self.loaded_trajectory_plan = None
         self.sim_path_full = []
         self.sim_tip_trail = []
         self.real_tip_trail = []
@@ -107,6 +175,7 @@ class MainWindow(QMainWindow):
         self.execution_complete = False
         self.execution_saved = False
         self.execution_error = None
+        self.execution_state = "IDLE"
         self.execution_elapsed = 0.0
         self.execution_session_active = False
         self.execution_session_start = None
@@ -115,9 +184,22 @@ class MainWindow(QMainWindow):
         self.execution_last_power_w = None
         self.execution_stop_event = threading.Event()
         self.identification_logger = None
+        self.identification_settings = {
+            "experiment_id": "ID_NORMAL_001",
+            "trajectory_id": "",
+            "run_id": "RUN_01",
+            "commanded_speed": 50.0,
+            "payload_g": 0.0,
+            "contact_label": "NORMAL",
+            "grasp_context": "NONE",
+            "thermal_condition": "COLD",
+        }
         self._identification_last_timestamp = None
         self._identification_last_q = None
         self._identification_last_qdot = None
+        self._identification_lock = threading.RLock()
+        self.identification_output_path = None
+        self.identification_last_summary = None
         self.move_to_start_thread = None
         self.move_to_start_complete = False
         self.move_to_start_error = None
@@ -408,7 +490,7 @@ class MainWindow(QMainWindow):
         jog_scroll.setStyleSheet("QScrollArea { border: none; }")
         left_tabs.addTab(jog_scroll, "JOG")
 
-        # ---- Path Planning tab: geometry, constraints, points, playback ----
+        # ---- Pathways tab: geometry, constraints, points, playback ----
         traj_tab = QWidget()
         sim_layout = QVBoxLayout(traj_tab)
         sim_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
@@ -491,6 +573,76 @@ class MainWindow(QMainWindow):
         self.btn_run_sim.clicked.connect(self.trigger_simulation)
         sim_layout.addWidget(self.btn_run_sim)
 
+        self.btn_export_path = QPushButton("Export Pathway CSV")
+        self.btn_export_path.setEnabled(False)
+        self.btn_export_path.clicked.connect(self.export_cri_path)
+        sim_layout.addWidget(self.btn_export_path)
+
+        # ---- Execution tab: trajectory selection, run settings, and live metrics ----
+        execution_tab = QWidget()
+        execution_layout = QVBoxLayout(execution_tab)
+        execution_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        execution_layout.setContentsMargins(6, 6, 6, 6)
+        execution_layout.setSpacing(8)
+
+        trajectory_group = QGroupBox("Trajectory to Execute")
+        trajectory_layout = QGridLayout(trajectory_group)
+        self.cmb_trajectory_files = QComboBox()
+        self.cmb_trajectory_files.setEditable(False)
+        self.btn_load_trajectory = QPushButton("Load CSV")
+        self.btn_load_trajectory.clicked.connect(self.load_selected_trajectory)
+        self.btn_browse_trajectory = QPushButton("Browse...")
+        self.btn_browse_trajectory.clicked.connect(self.browse_trajectory_file)
+        self.lbl_loaded_trajectory = QLabel("No trajectory loaded")
+        self.lbl_loaded_waypoints = QLabel("Waypoints: 0")
+        self.lbl_loaded_start = QLabel("Start: --")
+        self.lbl_loaded_target = QLabel("Target: --")
+        self.lbl_trajectory_status = QLabel("Validation: pending")
+
+        trajectory_layout.addWidget(QLabel("Saved pathway:"), 0, 0)
+        trajectory_layout.addWidget(self.cmb_trajectory_files, 0, 1, 1, 2)
+        trajectory_layout.addWidget(self.btn_load_trajectory, 1, 1)
+        trajectory_layout.addWidget(self.btn_browse_trajectory, 1, 2)
+        trajectory_layout.addWidget(QLabel("Loaded:"), 2, 0)
+        trajectory_layout.addWidget(self.lbl_loaded_trajectory, 2, 1, 1, 2)
+        trajectory_layout.addWidget(self.lbl_loaded_waypoints, 3, 0, 1, 3)
+        trajectory_layout.addWidget(self.lbl_loaded_start, 4, 0, 1, 3)
+        trajectory_layout.addWidget(self.lbl_loaded_target, 5, 0, 1, 3)
+        trajectory_layout.addWidget(self.lbl_trajectory_status, 6, 0, 1, 3)
+        execution_layout.addWidget(trajectory_group)
+
+        run_settings_layout = QHBoxLayout()
+        self.spin_robot_velocity = QDoubleSpinBox()
+        self.spin_robot_velocity.setRange(1.0, 100.0)
+        self.spin_robot_velocity.setValue(50.0)
+        self.spin_robot_velocity.setDecimals(0)
+        self.spin_robot_velocity.setSuffix(" %")
+        self.spin_robot_velocity.setToolTip("CRI velocity used for preparation and task motion")
+        run_settings_layout.addWidget(QLabel("Motion speed:"))
+        run_settings_layout.addWidget(self.spin_robot_velocity)
+        self.btn_identification_settings = QPushButton("Identification Settings...")
+        self.btn_identification_settings.clicked.connect(self.open_identification_settings)
+        run_settings_layout.addWidget(self.btn_identification_settings)
+        run_settings_layout.addStretch()
+        execution_layout.addLayout(run_settings_layout)
+
+        self.btn_execute_path = QPushButton("Run")
+        self.btn_execute_path.setStyleSheet("background-color: #c0392b; color: white; padding: 6px; font-weight: bold;")
+        self.btn_execute_path.setEnabled(False)
+        self.btn_execute_path.clicked.connect(self.execute_path)
+        execution_layout.addWidget(self.btn_execute_path)
+
+        identification_controls = QHBoxLayout()
+        self.btn_start_identification = QPushButton("Start Identification Run")
+        self.btn_start_identification.setEnabled(False)
+        self.btn_start_identification.clicked.connect(self.start_identification_recording)
+        self.btn_stop_identification = QPushButton("Stop & Save Run")
+        self.btn_stop_identification.setEnabled(False)
+        self.btn_stop_identification.clicked.connect(self.stop_identification_recording)
+        identification_controls.addWidget(self.btn_start_identification)
+        identification_controls.addWidget(self.btn_stop_identification)
+        execution_layout.addLayout(identification_controls)
+
         # Playback controls
         playback_layout = QVBoxLayout()
         slider_layout = QHBoxLayout()
@@ -538,29 +690,7 @@ class MainWindow(QMainWindow):
         traj_scroll.setWidgetResizable(True)
         traj_scroll.setWidget(traj_tab)
         traj_scroll.setStyleSheet("QScrollArea { border: none; }")
-        left_tabs.addTab(traj_scroll, "Path Planning")
-
-        # ---- Execution tab: path controls, live session metrics, exports ----
-        execution_tab = QWidget()
-        execution_layout = QVBoxLayout(execution_tab)
-        execution_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        execution_layout.setContentsMargins(6, 6, 6, 6)
-        execution_layout.setSpacing(8)
-
-        # Shared motion speed for Move to Start and Execute Path.
-        vel_layout = QHBoxLayout()
-        vel_layout.setSpacing(3)
-        vel_layout.addWidget(QLabel("Motion Speed (%):", ), 0)
-        self.spin_robot_velocity = QDoubleSpinBox()
-        self.spin_robot_velocity.setRange(1.0, 100.0)
-        self.spin_robot_velocity.setValue(50.0)
-        self.spin_robot_velocity.setDecimals(0)
-        self.spin_robot_velocity.setSuffix(" %")
-        self.spin_robot_velocity.setToolTip("CRI speed used by Move to Start and Execute Path")
-        self.spin_robot_velocity.setMaximumWidth(60)
-        vel_layout.addWidget(self.spin_robot_velocity, 0)
-        vel_layout.addStretch()
-        execution_layout.addLayout(vel_layout)
+        left_tabs.addTab(traj_scroll, "Pathways")
 
         session_group = QGroupBox("Execution Session")
         session_layout = QGridLayout()
@@ -577,17 +707,6 @@ class MainWindow(QMainWindow):
         session_group.setLayout(session_layout)
         execution_layout.addWidget(session_group)
         
-        # Export ordered joint targets for CRI inspection or reuse.
-        export_btn_layout = QHBoxLayout()
-        self.btn_export_path = QPushButton("📤 Export CRI Path CSV")
-        self.btn_export_path.setStyleSheet("background-color: #e74c3c; color: white; padding: 6px; font-weight: bold; font-size: 11px;")
-        self.btn_export_path.setEnabled(False)
-        self.btn_export_path.setMinimumHeight(40)
-        self.btn_export_path.clicked.connect(self.export_cri_path)
-        export_btn_layout.addWidget(self.btn_export_path)
-
-        execution_layout.addLayout(export_btn_layout)
-
         # Export real-time diagnostics data
         export_diag_layout = QHBoxLayout()
         self.btn_export_voltage_csv = QPushButton("📥 Export Diagnostics CSV")
@@ -607,55 +726,10 @@ class MainWindow(QMainWindow):
         self.btn_move_to_start.clicked.connect(self.move_to_start)
         robot_control_layout.addWidget(self.btn_move_to_start)
         
-        self.btn_execute_path = QPushButton("▶️ Execute Path")
-        self.btn_execute_path.setStyleSheet("background-color: #c0392b; color: white; padding: 5px; font-weight: bold; font-size: 10px;")
-        self.btn_execute_path.setEnabled(False)
-        self.btn_execute_path.clicked.connect(self.execute_path)
-        robot_control_layout.addWidget(self.btn_execute_path)
-        
         execution_layout.addLayout(robot_control_layout)
-
-        identification_group = QGroupBox("Identification Recording")
-        identification_layout = QGridLayout()
-        identification_layout.setHorizontalSpacing(6)
-        identification_layout.setVerticalSpacing(6)
-
-        self.le_experiment_id = QLineEdit("ID_NORMAL_001")
-        self.le_trajectory_id = QLineEdit("JOINT2_SWEEP_MEDIUM")
-        self.le_run_id = QLineEdit("RUN_01")
-        self.spin_payload_g = QDoubleSpinBox()
-        self.spin_payload_g.setRange(0.0, 10000.0)
-        self.spin_payload_g.setValue(0.0)
-        self.spin_payload_g.setSuffix(" g")
-        self.combo_contact_label = QComboBox()
-        self.combo_contact_label.addItems(["NORMAL", "CONTACT", "COLLISION", "UNKNOWN"])
-        self.combo_grasp_context = QComboBox()
-        self.combo_grasp_context.addItems(["NONE", "FALSE", "TRUE"])
-        self.combo_thermal_condition = QComboBox()
-        self.combo_thermal_condition.addItems(["COLD", "WARM"])
-
-        for label_text, widget in [
-            ("Experiment ID:", self.le_experiment_id),
-            ("Trajectory ID:", self.le_trajectory_id),
-            ("Run ID:", self.le_run_id),
-            ("Payload (g):", self.spin_payload_g),
-            ("Contact label:", self.combo_contact_label),
-            ("Grasp context:", self.combo_grasp_context),
-            ("Thermal condition:", self.combo_thermal_condition),
-        ]:
-            identification_layout.addWidget(QLabel(label_text), identification_layout.rowCount(), 0)
-            identification_layout.addWidget(widget, identification_layout.rowCount() - 1, 1)
-
-        self.btn_start_identification = QPushButton("Start Identification Run")
-        self.btn_stop_identification = QPushButton("Stop & Save Run")
-        self.btn_stop_identification.setEnabled(False)
-        self.btn_start_identification.clicked.connect(self.start_identification_recording)
-        self.btn_stop_identification.clicked.connect(self.stop_identification_recording)
-        identification_layout.addWidget(self.btn_start_identification, identification_layout.rowCount(), 0)
-        identification_layout.addWidget(self.btn_stop_identification, identification_layout.rowCount() - 1, 1)
-        identification_group.setLayout(identification_layout)
-        execution_layout.addWidget(identification_group)
         execution_layout.addStretch()
+
+        self._populate_trajectory_files()
 
         execution_scroll = QScrollArea()
         execution_scroll.setWidgetResizable(True)
@@ -745,66 +819,237 @@ class MainWindow(QMainWindow):
     def _execution_motion_speed(self):
         return float(self.spin_robot_velocity.value())
 
-    def _get_identification_metadata(self):
-        return {
-            "experiment_id": self.le_experiment_id.text().strip() or "ID_NORMAL_001",
-            "trajectory_id": self.le_trajectory_id.text().strip() or "UNSPECIFIED_TRAJECTORY",
-            "run_id": self.le_run_id.text().strip() or "RUN_01",
-            "commanded_speed": float(self.spin_robot_velocity.value()),
-            "payload_g": float(self.spin_payload_g.value()),
-            "contact_label": self.combo_contact_label.currentText(),
-            "grasp_context": self.combo_grasp_context.currentText(),
-            "thermal_condition": self.combo_thermal_condition.currentText(),
-        }
+    def _trajectory_directory(self):
+        return self.path_executor.ensure_trajectory_directory("Pathways")
 
-    def start_identification_recording(self):
-        if not self.manager.robot.connected:
-            QMessageBox.warning(self, "Not Connected", "Connect to the robot before starting an identification run.")
+    def _populate_trajectory_files(self):
+        directory = self._trajectory_directory()
+        files = sorted(directory.glob("*.csv"))
+        self.cmb_trajectory_files.clear()
+        if not files:
+            self.cmb_trajectory_files.addItem("No CSV files found")
+            self.cmb_trajectory_files.setEnabled(False)
+            self.lbl_loaded_trajectory.setText("No trajectory loaded")
             return
 
-        if self.identification_logger is not None:
-            self.stop_identification_recording()
+        self.cmb_trajectory_files.setEnabled(True)
+        for file_path in files:
+            self.cmb_trajectory_files.addItem(file_path.name)
 
-        metadata = self._get_identification_metadata()
-        self.identification_logger = IdentificationLogger(
-            output_dir="identification_data",
-            experiment_id=metadata["experiment_id"],
-            trajectory_id=metadata["trajectory_id"],
-            run_id=metadata["run_id"],
-            commanded_speed=metadata["commanded_speed"],
-            payload_g=metadata["payload_g"],
-            contact_label=metadata["contact_label"],
-            grasp_context=metadata["grasp_context"],
-            thermal_condition=metadata["thermal_condition"],
-            overwrite=False,
+    def _update_loaded_trajectory_summary(self, plan=None):
+        if plan is None:
+            self.lbl_loaded_trajectory.setText("No trajectory loaded")
+            self.lbl_loaded_waypoints.setText("Waypoints: 0")
+            self.lbl_loaded_start.setText("Start: --")
+            self.lbl_loaded_target.setText("Target: --")
+            self.lbl_trajectory_status.setText("Validation: pending")
+            return
+
+        start = plan.start_angles
+        target = plan.final_target or start
+        self.lbl_loaded_trajectory.setText(Path(plan.file_path).name if plan.file_path else "Loaded from memory")
+        self.lbl_loaded_waypoints.setText(f"Waypoints: {len(plan.task_waypoints)}")
+        self.lbl_loaded_start.setText(f"Start: {', '.join(f'{value:.1f}°' for value in start)}")
+        self.lbl_loaded_target.setText(f"Target: {', '.join(f'{value:.1f}°' for value in target)}")
+        self.lbl_trajectory_status.setText("Validation: valid")
+
+    def load_selected_trajectory(self):
+        directory = self._trajectory_directory()
+        selected = self.cmb_trajectory_files.currentText()
+        if selected == "No CSV files found":
+            QMessageBox.information(self, "No Trajectory Files", "No trajectory CSV files were found in the Pathways folder.")
+            return
+
+        file_path = directory / selected
+        self.load_trajectory_file(file_path)
+
+    def browse_trajectory_file(self):
+        directory = self._trajectory_directory()
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select a trajectory CSV",
+            str(directory),
+            "CSV trajectory files (*.csv)",
         )
-        self._identification_last_timestamp = None
-        self._identification_last_q = None
-        self._identification_last_qdot = None
-        self.btn_start_identification.setEnabled(False)
-        self.btn_stop_identification.setEnabled(True)
-        self.lbl_execution.setText("Execution: Recording identification data")
+        if not file_path:
+            return
+        self.load_trajectory_file(file_path)
+
+    def load_trajectory_file(self, file_path):
+        try:
+            plan = self.path_executor.load_trajectory_csv(file_path)
+        except Exception as exc:
+            self.loaded_trajectory_plan = None
+            self.loaded_trajectory_path = None
+            self.path_executor.path_data = []
+            self.path_executor.start_angles = []
+            self.btn_execute_path.setEnabled(False)
+            self.lbl_trajectory_status.setText(f"Validation: invalid ({exc})")
+            QMessageBox.warning(self, "Trajectory Load Failed", f"Could not load the selected trajectory:\n{exc}")
+            return
+
+        self.loaded_trajectory_path = str(file_path)
+        self.loaded_trajectory_plan = plan
+        self.path_executor.path_data = list(plan.task_waypoints)
+        self.path_executor.start_angles = list(plan.start_angles)
+        self._update_loaded_trajectory_summary(plan)
+
+        if self.manager.robot.connected:
+            self.btn_execute_path.setEnabled(True)
+            self.btn_move_to_start.setEnabled(True)
+
+        self.status_label.setText(f"Status: Connected 🟢 | Loaded: {Path(file_path).name}")
+
+        if self.cmb_trajectory_files.count() and self.cmb_trajectory_files.currentText() != Path(file_path).name:
+            index = self.cmb_trajectory_files.findText(Path(file_path).name)
+            if index >= 0:
+                self.cmb_trajectory_files.setCurrentIndex(index)
+
+    def open_identification_settings(self):
+        trajectory_id = Path(self.loaded_trajectory_path).stem if self.loaded_trajectory_path else ""
+        values = dict(self.identification_settings)
+        values["commanded_speed"] = self._execution_motion_speed()
+        dialog = IdentificationSettingsDialog(values, trajectory_id, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.identification_settings = dialog.get_values()
+            self.spin_robot_velocity.setValue(self.identification_settings["commanded_speed"])
+
+    def _get_identification_metadata(self):
+        metadata = dict(self.identification_settings)
+        metadata["commanded_speed"] = self._execution_motion_speed()
+        selected_trajectory_id = Path(self.loaded_trajectory_path).stem if self.loaded_trajectory_path else "UNSPECIFIED_TRAJECTORY"
+        metadata["trajectory_id"] = metadata.get("trajectory_id") or selected_trajectory_id
+        return metadata
+
+    def start_identification_recording(self, silent=False, metadata_override=None):
+        if not self.manager.robot.connected:
+            if not silent:
+                QMessageBox.warning(self, "Not Connected", "Connect to the robot before starting an identification run.")
+            return False
+
+        with self._identification_lock:
+            if self.identification_logger is not None:
+                if not silent:
+                    QMessageBox.warning(self, "Run Already Active", "Stop and save the active identification run before starting another.")
+                return False
+
+        metadata = dict(metadata_override) if metadata_override is not None else self._get_identification_metadata()
+        trajectory_id = str(metadata.get("trajectory_id") or "UNSPECIFIED_TRAJECTORY")
+        metadata["trajectory_id"] = trajectory_id
+        if not all(str(metadata.get(key, "")).strip() for key in ("experiment_id", "trajectory_id", "run_id")):
+            if not silent:
+                QMessageBox.warning(self, "Incomplete Metadata", "Experiment ID, trajectory ID, and run ID are required.")
+            return False
+        if not silent and not self._confirm_identification_condition(metadata):
+            return False
+        existing_run = find_existing_identification_run(
+            "identification_data", str(metadata["run_id"])
+        )
+        if existing_run is not None:
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "Run ID Already Used",
+                    f"Run ID {metadata['run_id']} already appears in {existing_run.name}. "
+                    "Choose a new run ID for this physical execution.",
+                )
+            return False
+
+        try:
+            with self._identification_lock:
+                if self.identification_logger is not None:
+                    if not silent:
+                        QMessageBox.warning(self, "Run Already Active", "Stop and save the active identification run before starting another.")
+                    return False
+                self.identification_logger = IdentificationLogger(
+                    output_dir="identification_data",
+                    experiment_id=metadata["experiment_id"],
+                    trajectory_id=trajectory_id,
+                    run_id=metadata["run_id"],
+                    commanded_speed=metadata["commanded_speed"],
+                    payload_g=metadata["payload_g"],
+                    contact_label=metadata["contact_label"],
+                    grasp_context=metadata["grasp_context"],
+                    thermal_condition=metadata["thermal_condition"],
+                    overwrite=False,
+                )
+                logger = self.identification_logger
+            self.identification_output_path = str(logger.file_path)
+            self.identification_last_summary = None
+            self._identification_last_timestamp = None
+            self._identification_last_q = None
+            self._identification_last_qdot = None
+        except Exception as exc:
+            if not silent:
+                QMessageBox.critical(self, "Identification Logger Error", str(exc))
+            return False
+        if not silent:
+            self.btn_start_identification.setEnabled(False)
+            self.btn_stop_identification.setEnabled(True)
+            QMessageBox.information(
+                self,
+                "Identification Recording Started",
+                f"Writing raw telemetry to:\n{logger.file_path}",
+            )
+        return True
+
+    def _confirm_identification_condition(self, metadata):
+        is_normal_no_load = (
+            float(metadata.get("payload_g", float("nan"))) == 0.0
+            and str(metadata.get("contact_label", "")).upper() == "NORMAL"
+            and str(metadata.get("grasp_context", "")).upper() == "NONE"
+        )
+        if is_normal_no_load:
+            return True
+        condition = (
+            f"payload_g={metadata.get('payload_g')}, "
+            f"contact_label={metadata.get('contact_label')}, "
+            f"grasp_context={metadata.get('grasp_context')}"
+        )
+        answer = QMessageBox.question(
+            self,
+            "Non-Standard Identification Condition",
+            "This run is not labeled as NORMAL no-load data. Its metadata will remain "
+            f"{condition}. Continue with this explicitly classified condition?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def stop_identification_recording(self, silent=False):
+        with self._identification_lock:
+            logger = self.identification_logger
+            if logger is None:
+                return None
+            self.identification_logger = None
+            self._identification_last_timestamp = None
+            self._identification_last_q = None
+            self._identification_last_qdot = None
+        summary = logger.close()
+        self.identification_last_summary = summary
+        if not silent:
+            self.btn_start_identification.setEnabled(self.manager.robot.connected)
+            self.btn_stop_identification.setEnabled(False)
+            status = summary.get("quality_status", "FAIL") if summary else "FAIL"
+            QMessageBox.information(
+                self,
+                "Identification Run Saved",
+                f"{status}: {logger.file_path}\n"
+                f"Rows: {summary.get('row_count', 0) if summary else 0}; "
+                f"writer drops: {summary.get('writer_dropped_sample_count', 0) if summary else 0}\n"
+                f"Quality sidecar: {logger.summary_path}",
+            )
+        return summary
+
+    def _show_identification_close_summary(self, summary):
+        file_path = summary.get("file_path", self.identification_output_path or "")
+        quality_status = summary.get("quality_status", "FAIL")
+        self.status_label.setToolTip(str(file_path))
         QMessageBox.information(
             self,
-            "Identification Recording Started",
-            f"Writing raw telemetry to:\n{self.identification_logger.file_path}",
+            "Identification Run Closed",
+            f"{quality_status}: saved identification data to:\n{file_path}",
         )
-
-    def stop_identification_recording(self):
-        if self.identification_logger is None:
-            self.btn_start_identification.setEnabled(True)
-            self.btn_stop_identification.setEnabled(False)
-            return
-
-        self.identification_logger.close()
-        self.identification_logger = None
-        self._identification_last_timestamp = None
-        self._identification_last_q = None
-        self._identification_last_qdot = None
-        self.btn_start_identification.setEnabled(True)
-        self.btn_stop_identification.setEnabled(False)
-        self.lbl_execution.setText("Execution: Idle")
-        QMessageBox.information(self, "Identification Run Saved", "The identification run was closed and saved.")
 
     def _reset_execution_metrics(self):
         self.execution_session_active = False
@@ -824,8 +1069,6 @@ class MainWindow(QMainWindow):
         self.execution_energy_j = 0.0
         self.execution_last_sample_time = None
         self.execution_last_power_w = None
-        self.lbl_execution_timer.setText("00:00.0")
-        self.lbl_execution_energy.setText("0.000 J (0.000 Wh)")
 
     def _update_execution_metrics(self, sample_time, power_w):
         if not self.execution_session_active:
@@ -839,7 +1082,7 @@ class MainWindow(QMainWindow):
 
         self.execution_last_sample_time = sample_time
         self.execution_last_power_w = power_w
-        self.execution_elapsed = sample_time - self.execution_session_start
+        self.execution_elapsed = max(0.0, time.monotonic() - self.execution_session_start)
         self.lbl_execution_timer.setText(self._format_execution_time(self.execution_elapsed))
         self.lbl_execution_energy.setText(
             f"{self.execution_energy_j:.3f} J ({self.execution_energy_j / 3600.0:.3f} Wh)"
@@ -980,7 +1223,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(self.total_frames > 0)
         self.btn_export_path.setEnabled(self.total_frames > 0)
         self.btn_move_to_start.setEnabled(self.total_frames > 0 and self.manager.robot.connected)
-        self.btn_execute_path.setEnabled(self.total_frames > 0 and self.manager.robot.connected)
+        self.btn_execute_path.setEnabled(bool(self.loaded_trajectory_plan) and self.manager.robot.connected)
 
     def _show_ik_failure(self, stage):
         reason = self.kinematics.last_ik_error or "the requested point is outside the robot workspace"
@@ -1019,7 +1262,7 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_export_path.setEnabled(False)
         self.btn_move_to_start.setEnabled(False)
-        self.btn_execute_path.setEnabled(False)
+        self.btn_execute_path.setEnabled(bool(self.loaded_trajectory_plan) and self.manager.robot.connected)
         self._reset_trails()
 
         # Immediately restore the previous simulated pose
@@ -1048,19 +1291,23 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Path", "There is no simulation pathway to export.")
             return
 
-        default_path = os.path.join(os.getcwd(), "cri_path_commands.csv")
+        default_dir = self.path_executor.default_trajectory_directory()
+        default_dir.mkdir(parents=True, exist_ok=True)
+        default_path = str(default_dir / "trajectory_export.csv")
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save CRI Path Commands", default_path, "CSV Files (*.csv)"
+            self, "Save Trajectory CSV", default_path, "CSV Files (*.csv)"
         )
         if not file_path:
             return
 
         try:
             velocity = self._execution_motion_speed()
-            self.path_executor.export_to_csv_cri_commands(file_path, velocity_percent=velocity)
+            self.path_executor.export_trajectory_csv(file_path, velocity_percent=velocity, start_angles=self.path_executor.start_angles or None)
+            self._populate_trajectory_files()
+            self.load_trajectory_file(file_path)
             QMessageBox.information(self, "Export Successful", 
                                   f"Robot joint angles exported to:\n{file_path}\n\n"
-                                  f"Format: Step, Time (s), J1-J6 (degrees), Velocity (%)")
+                                  f"Format: Phase,Step,J1-J6 (degrees),Velocity (%)")
         except Exception as e:
             QMessageBox.warning(self, "Export Failed", f"Could not save CSV:\n{e}")
 
@@ -1297,12 +1544,13 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Status: Connected 🟢")
             self.status_label.setStyleSheet("font-weight: bold; color: green;")
             self.btn_connect.setEnabled(False)
+            self.btn_start_identification.setEnabled(True)
             for btn in [self.btn_disconnect, self.btn_reset, self.btn_enable, self.btn_home] + self.jog_buttons:
                 btn.setEnabled(True)
             # Enable robot control buttons if a path is loaded.
             if self.total_frames > 0:
                 self.btn_move_to_start.setEnabled(True)
-                self.btn_execute_path.setEnabled(True)
+            self.btn_execute_path.setEnabled(bool(self.loaded_trajectory_plan))
             # Auto-pause simulation if requested
             if self.chk_auto_pause_on_connect.isChecked() and self.is_playing:
                 self.pause_playback()
@@ -1320,17 +1568,19 @@ class MainWindow(QMainWindow):
     def disconnect_robot(self):
         self.execution_latency.cancel_pending()
         self._flush_completed_latency_trials()
+        closed_run = self.stop_identification_recording(silent=True)
         self.manager.disconnect()
         self._reset_trails()
         self._reset_execution_metrics()
         if self.telemetry_logger is not None:
             self.telemetry_logger.close()
             self.telemetry_logger = None
-        if self.identification_logger is not None:
-            self.identification_logger.close()
-            self.identification_logger = None
+        self.btn_start_identification.setEnabled(False)
+        self.btn_stop_identification.setEnabled(False)
         self.status_label.setText("Status: Disconnected ❌")
         self.status_label.setStyleSheet("font-weight: bold; color: red;")
+        if closed_run is not None:
+            self._show_identification_close_summary(closed_run)
         self.btn_connect.setEnabled(True)
         for btn in [self.btn_disconnect, self.btn_reset, self.btn_enable, self.btn_home] + self.jog_buttons:
             btn.setEnabled(False)
@@ -1344,13 +1594,11 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self.execution_latency.cancel_pending()
         self._flush_completed_latency_trials()
+        self.stop_identification_recording(silent=True)
         self.manager.disconnect()
         if self.telemetry_logger is not None:
             self.telemetry_logger.close()
             self.telemetry_logger = None
-        if self.identification_logger is not None:
-            self.identification_logger.close()
-            self.identification_logger = None
         self.latency_experiment_logger.close()
         super().closeEvent(event)
 
@@ -1390,56 +1638,45 @@ class MainWindow(QMainWindow):
         # No direct UI updates here because this callback runs in the receive thread.
         # The tracker uses STATUS packet timing, not the slower GUI timer.
         with self.manager.robot.robot_state_lock:
-            positions = [
-                state.joints_current.A1,
-                state.joints_current.A2,
-                state.joints_current.A3,
-                state.joints_current.A4,
-                state.joints_current.A5,
-                state.joints_current.A6,
-            ]
-        self.execution_latency.update_telemetry(positions, t_rx)
-
-        if self.identification_logger is None:
-            return
-
-        current_ts = float(t_rx if t_rx is not None else time.perf_counter())
-        q = list(positions)
-        currents = [
-            float(current)
-            for current in (list(state.current_joints[:6]) if len(state.current_joints) >= 6 else [0.0] * 6)
-        ]
-        qdot = [0.0] * 6
-        qddot = [0.0] * 6
-        if self._identification_last_timestamp is not None and self._identification_last_q is not None:
-            dt = current_ts - self._identification_last_timestamp
-            if dt > 0.0:
-                qdot = [
-                    (q[idx] - self._identification_last_q[idx]) / dt
-                    for idx in range(6)
+            fields_seen = set(state.status_fields_seen)
+            if "POSJOINTCURRENT" in fields_seen:
+                positions = [
+                    state.joints_current.A1,
+                    state.joints_current.A2,
+                    state.joints_current.A3,
+                    state.joints_current.A4,
+                    state.joints_current.A5,
+                    state.joints_current.A6,
                 ]
-                if self._identification_last_qdot is not None:
-                    qddot = [
-                        (qdot[idx] - self._identification_last_qdot[idx]) / dt
-                        for idx in range(6)
-                    ]
+            else:
+                positions = [float("nan")] * 6
+            currents = (
+                [float(value) for value in state.current_joints[:6]]
+                if "CURRENTJOINTS" in fields_seen and len(state.current_joints) >= 6
+                else [float("nan")] * 6
+            )
+        if all(np.isfinite(value) for value in positions):
+            self.execution_latency.update_telemetry(positions, t_rx)
 
-        self.identification_logger.log_sample(
-            timestamp=current_ts,
-            q=q,
-            qdot=qdot,
-            current=currents,
-            qddot=qddot,
-            metadata=self._get_identification_metadata(),
-        )
-        self._identification_last_timestamp = current_ts
-        self._identification_last_q = q
-        self._identification_last_qdot = qdot
+        with self._identification_lock:
+            logger = self.identification_logger
+            if logger is None:
+                return
+            current_ts = float(t_rx if t_rx is not None else time.perf_counter())
+            logger.log_sample(
+                timestamp=current_ts,
+                q=positions,
+                qdot=None,
+                current=currents,
+            )
 
     def move_to_start(self):
-        """Move the robot to the first target in the planned path."""
-        if not self.path_executor.path_data:
-            QMessageBox.warning(self, "No Path", "No path loaded. Please calculate a path first.")
+        """Move the robot to the trajectory-defined start pose."""
+        target = list(self.path_executor.start_angles) if self.path_executor.start_angles else None
+        if not target and self.path_executor.path_data:
+            target = list(self.path_executor.path_data[0])
+        if not target:
+            QMessageBox.warning(self, "No Path", "No trajectory start pose is available. Please load or calculate a path first.")
             return
         
         if not self.manager.robot.connected:
@@ -1449,9 +1686,7 @@ class MainWindow(QMainWindow):
         self._show_realtime_view()
         
         try:
-            # Get the first waypoint (start position).
-            start_angles = self.path_executor.path_data[0]
-            start_angles = [float(a) for a in start_angles]
+            start_angles = [float(a) for a in target]
             velocity = self._execution_motion_speed()
             
             self.btn_move_to_start.setEnabled(False)
@@ -1495,24 +1730,64 @@ class MainWindow(QMainWindow):
         self.move_to_start_complete = True
 
     def execute_path(self):
-        """Execute the loaded spatial path through the CRI controller."""
-        if not self.path_executor.path_data:
-            QMessageBox.warning(self, "No Path", "No path loaded. Please calculate a path first.")
+        """Execute a saved trajectory CSV by preparing to the start pose and then running the task path."""
+        if not self.path_executor.path_data and not self.loaded_trajectory_plan:
+            QMessageBox.warning(self, "No Path", "No trajectory is loaded. Please pick an existing CSV or calculate a path in the planning tab.")
             return
         
         if not self.manager.robot.connected:
             QMessageBox.warning(self, "Not Connected", "Robot is not connected. Please connect first.")
             return
+        if self.identification_logger is not None:
+            QMessageBox.warning(self, "Identification Run Active", "Stop and save the manual identification run before starting trajectory execution.")
+            return
+
+        path_data = list(self.path_executor.path_data)
+        trajectory_plan = self.loaded_trajectory_plan
+        if trajectory_plan is None:
+            QMessageBox.warning(self, "No Path", "Load a validated trajectory CSV from the Pathways tab before running.")
+            return
+
+        path_data = [list(waypoint) for waypoint in trajectory_plan.task_waypoints]
+        start_angles = list(trajectory_plan.start_angles)
+
+        if start_angles is None:
+            QMessageBox.warning(self, "No Start Pose", "The selected trajectory does not contain a valid start position.")
+            return
+
+        task_path = list(path_data)
+
+        if not task_path:
+            QMessageBox.warning(self, "No Task Motion", "The selected trajectory does not contain task motion after the start pose.")
+            return
         
         try:
             velocity = self._execution_motion_speed()
-            num_waypoints = len(self.path_executor.path_data)
+            metadata = self._get_identification_metadata()
+            metadata["trajectory_id"] = metadata.get("trajectory_id") or trajectory_plan.trajectory_id
+            if not all(str(metadata.get(key, "")).strip() for key in ("experiment_id", "trajectory_id", "run_id")):
+                QMessageBox.warning(self, "Incomplete Metadata", "Experiment ID, trajectory ID, and run ID are required before motion.")
+                return
+            if not self._confirm_identification_condition(metadata):
+                return
+            existing_run = find_existing_identification_run(
+                "identification_data", str(metadata["run_id"])
+            )
+            if existing_run is not None:
+                QMessageBox.warning(
+                    self,
+                    "Run ID Already Used",
+                    f"Run ID {metadata['run_id']} already appears in {existing_run.name}. "
+                    "Choose a new run ID before starting robot motion.",
+                )
+                return
+            num_waypoints = len(task_path)
             
             # Confirm execution
             reply = QMessageBox.question(
-                self, "Execute Path",
-                f"Send {num_waypoints} path waypoints to CRI at {velocity}% velocity?\n\n"
-                "Make sure the start position is safe!",
+                self, "Run Experiment",
+                f"Prepare to start pose and execute {num_waypoints} task waypoints at {velocity}% velocity?\n\n"
+                "This will move to the CSV-defined start pose before the measured experiment motion.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             
@@ -1536,13 +1811,14 @@ class MainWindow(QMainWindow):
             self.execution_saved = False
             self.execution_error = None
             self.execution_elapsed = 0.0
+            self.execution_state = "PREPARING"
             self.execution_stop_event.clear()
-            self._start_execution_metrics()
+            self._reset_execution_metrics()
 
-            print(f"Starting CRI path execution with {num_waypoints} waypoints...")
+            print(f"Starting trajectory execution with preparation to {start_angles} and {num_waypoints} task waypoints...")
             self.execution_thread = threading.Thread(
                 target=self._execute_path_worker,
-                args=(self.path_executor.path_data.copy(), velocity),
+                args=(list(start_angles), task_path, velocity, metadata),
                 daemon=True,
             )
             self.execution_thread.start()
@@ -1550,36 +1826,80 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Error executing path:\n{e}")
             self.btn_move_to_start.setEnabled(True)
-            self.btn_execute_path.setEnabled(True)
+            self.btn_execute_path.setEnabled(bool(self.loaded_trajectory_plan) and self.manager.robot.connected)
 
-    def _execute_path_worker(self, path_data, velocity):
-        self.log_start_time = time.perf_counter()
-        self.is_recording_diagnostics = True
-        self.realtime_data_log.append(
-            self._build_diagnostics_record(
-                0.0,
-                self.manager.get_joint_angles_list(),
-                self.manager.get_joint_currents_list(),
-            )
-        )
+    def _execute_path_worker(self, start_angles, task_path, velocity, metadata):
+        error_message = None
+        self.execution_error = None
+        self.execution_complete = False
+        self.is_recording_diagnostics = False
 
-        execution_start_time = time.monotonic()
         try:
+            self.execution_state = "PREPARING"
+            if not self.manager.robot.connected:
+                raise RuntimeError("Robot disconnected before preparation could start.")
+            success = self.manager.robot.move_joints(
+                A1=start_angles[0], A2=start_angles[1], A3=start_angles[2],
+                A4=start_angles[3], A5=start_angles[4], A6=start_angles[5],
+                E1=0.0, E2=0.0, E3=0.0,
+                velocity=float(velocity),
+                wait_move_finished=True,
+                move_finished_timeout=60.0,
+            )
+            if not success:
+                raise RuntimeError("Robot failed to reach the trajectory start pose.")
+
+            self.start_identification_recording(silent=True, metadata_override=metadata)
+            if self.identification_logger is None:
+                raise RuntimeError("Identification logging could not be started; task motion was not sent.")
+
+            self.execution_state = "RECORDING/EXECUTING"
+            task_start = time.monotonic()
+            self.execution_session_start = task_start
+            self.execution_session_active = True
+            self.execution_elapsed = 0.0
+            self.execution_energy_j = 0.0
+            self.execution_last_sample_time = None
+            self.execution_last_power_w = None
+
+            self.log_start_time = time.perf_counter()
+            self.is_recording_diagnostics = True
             success, error_message = self.manager.execute_path(
-                path_data,
-                velocity,
+                task_path,
+                float(velocity),
                 stop_event=self.execution_stop_event,
             )
-        except Exception as e:
-            # Defense in depth: never let an unexpected exception kill this thread silently,
-            # since that would leave the GUI's buttons disabled forever.
-            error_message = f"Unexpected error during execution: {e}"
-
-        self.execution_elapsed = time.monotonic() - execution_start_time
-        self.execution_complete = True
-        self.execution_error = error_message
+            self.execution_elapsed = max(0.0, time.monotonic() - task_start)
+            if not success:
+                raise RuntimeError(error_message or "Task execution failed.")
+        except Exception as exc:
+            error_message = str(exc)
+            self.execution_error = error_message
+        finally:
+            self.execution_session_active = False
+            if self.identification_logger is not None:
+                self.stop_identification_recording(silent=True)
+            self.is_recording_diagnostics = False
+            self.execution_complete = True
+            self.execution_error = error_message
+            self.execution_state = "COMPLETE" if error_message is None else "ERROR"
 
     def system_loop(self):
+        with self._identification_lock:
+            recording_active = self.identification_logger is not None
+        self.btn_start_identification.setEnabled(
+            self.manager.robot.connected and not recording_active
+        )
+        self.btn_stop_identification.setEnabled(recording_active)
+        if not self.manager.robot.connected:
+            if recording_active:
+                closed_run = self.stop_identification_recording(silent=True)
+                if closed_run is not None:
+                    self.status_label.setText(
+                        f"Status: Disconnected | Identification {closed_run['quality_status']}"
+                    )
+                    self._show_identification_close_summary(closed_run)
+
         # Real-time robot view update (if connected)
         if self.manager.robot.connected:
             self.manager.maintain_jog()
@@ -1607,19 +1927,27 @@ class MainWindow(QMainWindow):
 
             real_currents = self.manager.get_joint_currents_list()
             for i, current_val in enumerate(real_currents):
-                self.lbl_joint_currents[i].setText(f"J{i+1}: {current_val:.3f} mA")
+                current_text = f"{current_val:.3f} mA" if np.isfinite(current_val) else "unavailable"
+                self.lbl_joint_currents[i].setText(f"J{i+1}: {current_text}")
 
             total_current = self.manager.get_total_current()
-            self.lbl_total_current.setText(f"Total Joint Current: {total_current:.3f} mA")
+            total_current_text = f"{total_current:.3f} mA" if np.isfinite(total_current) else "unavailable"
+            self.lbl_total_current.setText(f"Total Joint Current: {total_current_text}")
 
             self.lbl_supply_voltage.setText("Supply Voltage: 24 V")
             power_w = self.manager.get_supply_power_W()
-            self.lbl_power.setText(
-                f"Power: {power_w:.2f} W (24 V × {total_current:.0f} mA / 1000)"
-            )
-            self._update_execution_metrics(time.monotonic(), power_w)
+            if np.isfinite(power_w):
+                self.lbl_power.setText(
+                    f"Power: {power_w:.2f} W (24 V × {total_current:.0f} mA / 1000)"
+                )
+                self._update_execution_metrics(time.monotonic(), power_w)
+            else:
+                self.lbl_power.setText("Power: unavailable")
 
-            processing_time_ms = self._run_digital_twin_analytics(real_joints, real_currents)
+            if all(np.isfinite(current) for current in real_currents):
+                processing_time_ms = self._run_digital_twin_analytics(real_joints, real_currents)
+            else:
+                processing_time_ms = 0.0
             network = self.manager.robot.network_latency
             now = time.perf_counter()
             network.expire_pending(now)
@@ -1644,28 +1972,6 @@ class MainWindow(QMainWindow):
                     self._build_diagnostics_record(record_time, real_joints, real_currents)
                 )
 
-            if self.execution_complete and not self.execution_saved:
-                self.is_recording_diagnostics = False
-                self.execution_saved = True
-                if self.execution_error:
-                    self.lbl_execution.setText("Execution: Error")
-                    QMessageBox.warning(self, "Execution Error", self.execution_error)
-                else:
-                    self.lbl_execution.setText("Execution: Complete")
-                    QMessageBox.information(
-                        self,
-                        "Complete",
-                        f"Path execution completed!\nActual execution time: {self.execution_elapsed:.2f} seconds",
-                    )
-                    self.prompt_save_diagnostics_csv()
-                self.execution_complete = False
-                self.execution_error = None
-                self.execution_session_active = False
-                self.realtime_trail_active = False
-                if self.manager.robot.connected and self.total_frames > 0:
-                    self.btn_move_to_start.setEnabled(True)
-                    self.btn_execute_path.setEnabled(True)
-
             rad_real = np.radians(real_joints)
             real_points = self.kinematics.get_stick_points(rad_real)
             tip_position = real_points[-1]
@@ -1674,6 +1980,32 @@ class MainWindow(QMainWindow):
             if self.realtime_trail_active:
                 self.real_tip_trail.append(tuple(real_points[-1]))
             self.real_view.update_view(real_points, tip_trail=self.real_tip_trail)
+
+        if self.execution_state in {"PREPARING", "RECORDING/EXECUTING"}:
+            self.lbl_execution.setText(f"Execution: {self.execution_state.title()}")
+
+        if self.execution_complete and not self.execution_saved:
+            self.is_recording_diagnostics = False
+            self.execution_saved = True
+            self.lbl_execution_timer.setText(self._format_execution_time(self.execution_elapsed))
+            if self.execution_error:
+                self.lbl_execution.setText("Execution: Error")
+                QMessageBox.warning(self, "Run Failed", self.execution_error)
+            else:
+                self.lbl_execution.setText("Execution: Complete")
+                QMessageBox.information(
+                    self,
+                    "Run Complete",
+                    f"Task motion completed in {self.execution_elapsed:.2f} seconds.\n\n"
+                    f"Identification CSV saved to:\n{self.identification_output_path or 'identification_data'}",
+                )
+            self.execution_complete = False
+            self.execution_error = None
+            self.execution_session_active = False
+            self.realtime_trail_active = False
+            if self.manager.robot.connected:
+                self.btn_move_to_start.setEnabled(bool(self.loaded_trajectory_plan))
+                self.btn_execute_path.setEnabled(bool(self.loaded_trajectory_plan))
 
         # Simulation playback and simulation view (always active)
         if self.is_playing and self.total_frames > 0:

@@ -21,6 +21,29 @@ from .robot_state import (
 
 logger = logging.getLogger(__name__)
 
+_STATUS_SEGMENTS = frozenset(
+    {
+        "MODE", "POSJOINTSETPOINT", "POSJOINTCURRENT", "POSCARTROBOT",
+        "POSCARTPLATFORM", "POSCARTPLATTFORM", "OVERRIDE", "DIN", "DOUT",
+        "ESTOP", "SUPPLY", "CURRENTALL", "CURRENTJOINTS", "ERROR", "KINSTATE",
+        "OPMODE", "CARTSPEED", "GSIG", "FRAMEROBOT",
+    }
+)
+
+
+def _next_status_segment(parameters: list[str], start: int) -> int:
+    return next(
+        (index for index in range(start, len(parameters)) if parameters[index] in _STATUS_SEGMENTS),
+        len(parameters),
+    )
+
+
+def _float_or_nan(value: str) -> float:
+    try:
+        return float(value)
+    except ValueError:
+        return float("nan")
+
 
 class CRIProtocolParser:
     """Class handling the parsing of CRI messages to the robot state."""
@@ -143,13 +166,16 @@ class CRIProtocolParser:
                     segment_start_idx += 17
 
                 case "POSJOINTCURRENT":
-                    joints = []
-                    for i in range(16):
-                        joints.append(float(parameters[segment_start_idx + 1 + i]))
-
+                    segment_end = _next_status_segment(parameters, segment_start_idx + 1)
+                    joints = [
+                        _float_or_nan(value)
+                        for value in parameters[segment_start_idx + 1 : segment_end][:16]
+                    ]
+                    joints.extend([float("nan")] * (16 - len(joints)))
                     with self.robot_state_lock:
+                        self.robot_state.status_fields_seen.add("POSJOINTCURRENT")
                         self.robot_state.joints_current = JointsState(*joints)
-                    segment_start_idx += 17
+                    segment_start_idx = segment_end
 
                 case "POSCARTROBOT":
                     coords = []
@@ -216,14 +242,16 @@ class CRIProtocolParser:
                     segment_start_idx += 2
 
                 case "CURRENTJOINTS":
-                    currents = []
-                    for i in range(16):
-                        currents.append(float(int(parameters[segment_start_idx + 1 + i])))
-
+                    segment_end = _next_status_segment(parameters, segment_start_idx + 1)
+                    currents = [
+                        _float_or_nan(value)
+                        for value in parameters[segment_start_idx + 1 : segment_end][:16]
+                    ]
+                    currents.extend([float("nan")] * (16 - len(currents)))
                     with self.robot_state_lock:
                         self.robot_state.status_fields_seen.add("CURRENTJOINTS")
                         self.robot_state.current_joints = currents
-                    segment_start_idx += 17
+                    segment_start_idx = segment_end
 
                 case "ERROR":
                     errors = []

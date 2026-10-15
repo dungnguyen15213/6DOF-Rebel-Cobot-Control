@@ -61,8 +61,13 @@ class RebelManager:
 
     def get_joint_currents_list(self):
         """Returns joint current draw as a standard Python list."""
-        currents = self.robot.robot_state.current_joints
-        return [float(currents[i]) for i in range(6)]
+        with self.robot.robot_state_lock:
+            state = self.robot.robot_state
+            if "CURRENTJOINTS" not in state.status_fields_seen:
+                return [float("nan")] * 6
+            currents = list(state.current_joints[:6])
+        currents.extend([float("nan")] * (6 - len(currents)))
+        return [float(current) for current in currents]
 
     def get_total_current(self):
         """Returns the total current draw reported by the robot STATUS stream in milliamps.
@@ -70,12 +75,16 @@ class RebelManager:
         If CURRENTALL is not provided by the robot, fall back to summing individual
         CURRENTJOINTS values.
         """
-        total = float(self.robot.robot_state.current_total)
-        if total == 0.0:
-            joint_currents = self.robot.robot_state.current_joints
-            if joint_currents:
-                return float(sum(joint_currents))
-        return total
+        with self.robot.robot_state_lock:
+            state = self.robot.robot_state
+            fields_seen = set(state.status_fields_seen)
+            total = float(state.current_total)
+            joint_currents = list(state.current_joints)
+        if "CURRENTALL" in fields_seen:
+            return total
+        if "CURRENTJOINTS" in fields_seen and joint_currents:
+            return float(sum(joint_currents))
+        return float("nan")
 
     def has_supply_voltage(self):
         return "SUPPLY" in self.robot.robot_state.status_fields_seen

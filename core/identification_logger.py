@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 import statistics
-from datetime import datetime
+import threading
+import time
+from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
+from queue import Empty, Full, Queue
 from typing import Any, Iterable
 
 Q_VECTOR_COLUMNS = [f"q{i}" for i in range(1, 7)]
@@ -24,6 +29,7 @@ METADATA_COLUMNS = [
 
 IDENTIFICATION_COLUMNS = [
     "timestamp",
+    "sample_index",
     *Q_VECTOR_COLUMNS,
     *QDOT_VECTOR_COLUMNS,
     *CURRENT_VECTOR_COLUMNS,
@@ -65,8 +71,35 @@ def _as_float_list(values: Iterable[Any], length: int = 6) -> list[float]:
     return result[:length]
 
 
+def find_existing_identification_run(
+    output_dir: str | Path, run_id: str
+) -> Path | None:
+    """Return a prior CSV using this run ID, if present."""
+    for csv_path in Path(output_dir).glob("identification_*.csv"):
+        try:
+            with open(csv_path, "r", newline="", encoding="utf-8") as csvfile:
+                row = next(csv.DictReader(csvfile), None)
+        except (OSError, UnicodeError, csv.Error):
+            row = None
+        if row is not None and str(row.get("run_id", "")).strip() == str(run_id).strip():
+            return csv_path
+        sidecar_path = Path(f"{csv_path}.json")
+        try:
+            with open(sidecar_path, "r", encoding="utf-8") as sidecar_file:
+                summary = json.load(sidecar_file)
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if str(summary.get("metadata", {}).get("run_id", "")).strip() == str(run_id).strip():
+            return csv_path
+    return None
+
+
 class IdentificationLogger:
-    """Logs raw joint telemetry and metadata for offline system identification."""
+    """Queue telemetry quickly and write a traceable identification run in a worker."""
+
+    QUEUE_CAPACITY = 4096
+    FLUSH_EVERY_SAMPLES = 128
+    FLUSH_INTERVAL_SECONDS = 1.0
 
     def __init__(
         self,
@@ -81,11 +114,12 @@ class IdentificationLogger:
         thermal_condition: str = "COLD",
         overwrite: bool = False,
         filename: str | None = None,
+        queue_capacity: int | None = None,
     ) -> None:
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.metadata = {
+        self._metadata = {
             "experiment_id": experiment_id,
             "trajectory_id": trajectory_id,
             "run_id": run_id,
@@ -99,26 +133,54 @@ class IdentificationLogger:
         timestamp = datetime.now().strftime("%Y%m%dT%H%M%S")
         if filename is None:
             filename = (
-                f"identification_{_sanitize_filename_component(self.metadata['experiment_id'], 'ID')}"
-                f"_{_sanitize_filename_component(self.metadata['trajectory_id'], 'TRAJ')}"
-                f"_{_sanitize_filename_component(self.metadata['run_id'], 'RUN')}_{timestamp}.csv"
+                f"identification_{_sanitize_filename_component(self._metadata['experiment_id'], 'ID')}"
+                f"_{_sanitize_filename_component(self._metadata['trajectory_id'], 'TRAJ')}"
+                f"_{_sanitize_filename_component(self._metadata['run_id'], 'RUN')}_{timestamp}.csv"
             )
 
-        self.file_path = self.output_dir / filename
-        if self.file_path.exists() and not overwrite:
-            stem = self.file_path.stem
-            suffix = self.file_path.suffix
-            candidate = self.file_path
-            index = 1
-            while candidate.exists():
-                candidate = self.output_dir / f"{stem}_{index}{suffix}"
-                index += 1
-            self.file_path = candidate
-
-        self._file = open(self.file_path, "w", newline="", encoding="utf-8")
+        requested_path = self.output_dir / Path(filename).name
+        self.file_path, self._file = self._open_unique_file(requested_path, overwrite)
         self._writer = csv.DictWriter(self._file, fieldnames=IDENTIFICATION_COLUMNS)
         self._writer.writeheader()
         self._file.flush()
+        self.summary_path = Path(f"{self.file_path}.json")
+        self._queue: Queue[Any] = Queue(maxsize=queue_capacity or self.QUEUE_CAPACITY)
+        self._sentinel = object()
+        self._state_lock = threading.Lock()
+        self._close_lock = threading.Lock()
+        self._accepting_samples = True
+        self._closed = False
+        self._summary: dict[str, Any] | None = None
+        self._next_sample_index = 0
+        self.row_count = 0
+        self.dropped_sample_count = 0
+        self.writer_error: str | None = None
+        self._first_timestamp: float | None = None
+        self._last_timestamp: float | None = None
+        self._wall_start = datetime.now(timezone.utc).isoformat()
+        self._worker = threading.Thread(
+            target=self._writer_loop,
+            name="identification-csv-writer",
+            daemon=True,
+        )
+        self._worker.start()
+
+    @property
+    def metadata(self) -> dict[str, str]:
+        return dict(self._metadata)
+
+    @staticmethod
+    def _open_unique_file(path: Path, overwrite: bool):
+        if overwrite:
+            return path, open(path, "w", newline="", encoding="utf-8")
+        candidate = path
+        index = 1
+        while True:
+            try:
+                return candidate, open(candidate, "x", newline="", encoding="utf-8")
+            except FileExistsError:
+                candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
+                index += 1
 
     def log_sample(
         self,
@@ -129,40 +191,213 @@ class IdentificationLogger:
         qddot: Iterable[Any] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        q_values = _as_float_list(q, 6)
-        qdot_values = _as_float_list(qdot, 6)
-        current_values = _as_float_list(current, 6)
-        if qddot is None:
-            qddot_values = [0.0] * 6
-        else:
-            qddot_values = _as_float_list(qddot, 6)
+        del qdot, qddot, metadata  # Legacy arguments cannot alter frozen run data.
+        sample_timestamp = _coerce_float(timestamp, float("nan"))
+        sample_q = tuple(_as_float_list(q, 6))
+        sample_current = tuple(_as_float_list(current, 6))
+        with self._state_lock:
+            if not self._accepting_samples:
+                return
+            sample_index = self._next_sample_index
+            self._next_sample_index += 1
+            try:
+                self._queue.put_nowait(
+                    (sample_index, sample_timestamp, sample_q, sample_current)
+                )
+            except Full:
+                self.dropped_sample_count += 1
 
-        row: dict[str, Any] = {
-            "timestamp": float(timestamp),
-            **{col: value for col, value in zip(Q_VECTOR_COLUMNS, q_values)},
-            **{col: value for col, value in zip(QDOT_VECTOR_COLUMNS, qdot_values)},
-            **{col: value for col, value in zip(CURRENT_VECTOR_COLUMNS, current_values)},
-            **{col: value for col, value in zip(QDDOT_VECTOR_COLUMNS, qddot_values)},
-        }
+    def _writer_loop(self) -> None:
+        previous_timestamp: float | None = None
+        previous_q: tuple[float, ...] | None = None
+        previous_qdot: list[float] | None = None
+        last_flush = time.monotonic()
+        unflushed_rows = 0
 
-        effective_metadata = dict(self.metadata)
-        if metadata is not None:
-            effective_metadata.update(metadata)
-        for key in METADATA_COLUMNS:
-            row[key] = effective_metadata.get(key, self.metadata.get(key, ""))
+        while True:
+            timeout = max(0.0, self.FLUSH_INTERVAL_SECONDS - (time.monotonic() - last_flush))
+            try:
+                sample = self._queue.get(timeout=timeout)
+            except Empty:
+                sample = None
 
-        self._writer.writerow(row)
-        self._file.flush()
+            if sample is self._sentinel:
+                self._queue.task_done()
+                break
+            if sample is not None:
+                sample_index, timestamp, q_values, current_values = sample
+                dt = (
+                    timestamp - previous_timestamp
+                    if previous_timestamp is not None
+                    else float("nan")
+                )
+                if previous_q is not None and math.isfinite(dt) and dt > 0.0:
+                    qdot_values = [
+                        (q_values[index] - previous_q[index]) / dt
+                        if math.isfinite(q_values[index]) and math.isfinite(previous_q[index])
+                        else float("nan")
+                        for index in range(6)
+                    ]
+                else:
+                    qdot_values = [float("nan")] * 6
 
-    def close(self) -> None:
-        if not self._file.closed:
+                if previous_qdot is not None and math.isfinite(dt) and dt > 0.0:
+                    qddot_values = [
+                        (qdot_values[index] - previous_qdot[index]) / dt
+                        if math.isfinite(qdot_values[index]) and math.isfinite(previous_qdot[index])
+                        else float("nan")
+                        for index in range(6)
+                    ]
+                else:
+                    qddot_values = [float("nan")] * 6
+
+                row: dict[str, Any] = {
+                    "timestamp": timestamp,
+                    "sample_index": sample_index,
+                    **dict(zip(Q_VECTOR_COLUMNS, q_values)),
+                    **dict(zip(QDOT_VECTOR_COLUMNS, qdot_values)),
+                    **dict(zip(CURRENT_VECTOR_COLUMNS, current_values)),
+                    **dict(zip(QDDOT_VECTOR_COLUMNS, qddot_values)),
+                    **self._metadata,
+                }
+                try:
+                    self._writer.writerow(row)
+                    self.row_count += 1
+                    unflushed_rows += 1
+                    if self._first_timestamp is None:
+                        self._first_timestamp = timestamp
+                    self._last_timestamp = timestamp
+                except (OSError, csv.Error) as exc:
+                    self.writer_error = str(exc)
+                    self.dropped_sample_count += 1
+
+                previous_timestamp = timestamp
+                previous_q = q_values
+                previous_qdot = qdot_values if any(map(math.isfinite, qdot_values)) else None
+                self._queue.task_done()
+
+            now = time.monotonic()
+            if unflushed_rows >= self.FLUSH_EVERY_SAMPLES or now - last_flush >= self.FLUSH_INTERVAL_SECONDS:
+                try:
+                    self._file.flush()
+                except OSError as exc:
+                    self.writer_error = str(exc)
+                unflushed_rows = 0
+                last_flush = now
+
+        try:
+            self._file.flush()
+        except OSError as exc:
+            self.writer_error = str(exc)
+        finally:
             self._file.close()
+
+    def close(self) -> dict[str, Any] | None:
+        with self._close_lock:
+            if self._closed:
+                return self._summary
+            with self._state_lock:
+                self._accepting_samples = False
+                self._closed = True
+            self._queue.put(self._sentinel)
+            self._worker.join()
+            end_timestamp = self._last_timestamp
+            report = analyze_identification_csv(self.file_path)
+            status = _quality_status(report, self.dropped_sample_count, self.writer_error)
+            self._summary = {
+                "schema_version": 1,
+                "file_path": str(self.file_path),
+                "summary_path": str(self.summary_path),
+                "start_timestamp_utc": self._wall_start,
+                "end_timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "first_receive_timestamp_s": self._first_timestamp,
+                "last_receive_timestamp_s": end_timestamp,
+                "duration_s": (
+                    end_timestamp - self._first_timestamp
+                    if end_timestamp is not None and self._first_timestamp is not None
+                    else 0.0
+                ),
+                "row_count": self.row_count,
+                "metadata": self.metadata,
+                "units": report["schema_summary"]["units"],
+                "signal_provenance": {
+                    "timestamp": "host monotonic time at CRI STATUS reception",
+                    "q": "raw CRI STATUS POSJOINTCURRENT",
+                    "current": "raw CRI STATUS CURRENTJOINTS",
+                    "qdot": "derived from consecutive q samples using measured timestamp delta",
+                    "qddot": "candidate derived signal; unavailable until sufficient samples exist",
+                },
+                "writer_dropped_sample_count": self.dropped_sample_count,
+                "writer_error": self.writer_error,
+                "quality_status": status,
+                "quality_report": report,
+            }
+            sidecar_index = 1
+            while True:
+                try:
+                    summary_file = open(self.summary_path, "x", encoding="utf-8")
+                    break
+                except FileExistsError:
+                    self.summary_path = self.summary_path.with_name(
+                        f"{Path(self.summary_path).stem}_{sidecar_index}{self.summary_path.suffix}"
+                    )
+                    sidecar_index += 1
+            self._summary["summary_path"] = str(self.summary_path)
+            with summary_file:
+                json.dump(_json_safe(self._summary), summary_file, indent=2, allow_nan=False)
+            return self._summary
 
     def __enter__(self) -> "IdentificationLogger":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _quality_status(report: dict[str, Any], dropped: int, writer_error: str | None) -> str:
+    raw_columns = [*Q_VECTOR_COLUMNS, *CURRENT_VECTOR_COLUMNS]
+    missing_raw = any(report["missing_values"].get(column, 0) for column in raw_columns)
+    if (
+        report["total_rows"] == 0
+        or report["schema_summary"]["missing_columns"]
+        or missing_raw
+        or report.get("incomplete_current_rows", 0)
+        or report["missing_values"].get("timestamp", 0)
+        or report.get("invalid_numeric_values")
+        or not report["monotonic"]
+        or report["duplicate_timestamps"]
+        or report.get("metadata_inconsistent", False)
+        or any(report.get("metadata_missing_rows", {}).values())
+        or report.get("sample_index_gap_count", 0)
+        or report.get("malformed_row_count", 0)
+        or dropped
+        or writer_error
+    ):
+        return "FAIL"
+    if (
+        report.get("large_gap_count", 0)
+        or report.get("suspicious_all_zero_current_rows", 0)
+        or any(
+            values["adjacent_repeat_count"]
+            for values in report.get("repeated_current_values", {}).values()
+        )
+        or any(
+        report["missing_values"].get(column, 0)
+        for column in (*QDOT_VECTOR_COLUMNS, *QDDOT_VECTOR_COLUMNS)
+        )
+    ):
+        return "WARNING"
+    return "PASS"
 
 
 def _safe_float(value: Any) -> float | None:
@@ -176,175 +411,227 @@ def _safe_float(value: Any) -> float | None:
 
 
 def analyze_identification_csv(path: str | Path) -> dict[str, Any]:
-    """Returns a compact quality summary for an identification CSV file."""
+    """Analyze run integrity without imposing scientific acceptance thresholds."""
     csv_path = Path(path)
     with open(csv_path, "r", newline="", encoding="utf-8") as csvfile:
-        reader = csv.DictReader(csvfile)
+        reader = csv.DictReader(csvfile, strict=True)
         fieldnames = reader.fieldnames or []
         rows = list(reader)
 
-    total_rows = len(rows)
     required_columns = [
-        "timestamp",
-        *Q_VECTOR_COLUMNS,
-        *QDOT_VECTOR_COLUMNS,
-        *CURRENT_VECTOR_COLUMNS,
+        "timestamp", *Q_VECTOR_COLUMNS, *QDOT_VECTOR_COLUMNS,
+        *CURRENT_VECTOR_COLUMNS, *METADATA_COLUMNS,
     ]
     missing_columns = [column for column in required_columns if column not in fieldnames]
+    timestamps = [_safe_float(row.get("timestamp")) for row in rows]
+    valid_timestamps = [value for value in timestamps if value is not None]
+    dt_values = [
+        timestamps[index] - timestamps[index - 1]
+        for index in range(1, len(timestamps))
+        if timestamps[index] is not None and timestamps[index - 1] is not None
+    ]
+    positive_dt = [value for value in dt_values if value > 0.0]
+    timestamp_counts = Counter(valid_timestamps)
+    duplicate_values = {value for value, count in timestamp_counts.items() if count > 1}
+    dt_sorted = sorted(dt_values)
 
-    timestamps = []
-    for row in rows:
-        value = _safe_float(row.get("timestamp"))
-        if value is not None:
-            timestamps.append(value)
-
-    duplicate_timestamps = 0
-    seen_timestamps: set[float] = set()
-    duplicate_values: set[float] = set()
-    for row in rows:
-        value = _safe_float(row.get("timestamp"))
-        if value is None:
-            continue
-        if value in seen_timestamps:
-            duplicate_values.add(value)
-        else:
-            seen_timestamps.add(value)
-    duplicate_timestamps = sum(1 for row in rows if _safe_float(row.get("timestamp")) in duplicate_values)
-
-    invalid_dt_count = 0
-    dt_values: list[float] = []
-    for idx in range(1, len(timestamps)):
-        dt = timestamps[idx] - timestamps[idx - 1]
-        if math.isnan(dt) or math.isinf(dt):
-            invalid_dt_count += 1
-            continue
-        if dt < 0.0:
-            invalid_dt_count += 1
-        dt_values.append(dt)
-
-    dt_min = min(dt_values) if dt_values else None
-    dt_max = max(dt_values) if dt_values else None
-    dt_mean = statistics.fmean(dt_values) if dt_values else None
-    dt_median = statistics.median(dt_values) if dt_values else None
-    dt_percentiles = {}
-    if dt_values:
-        for pct in (1, 5, 95, 99):
-            dt_percentiles[str(pct)] = float(sorted(dt_values)[max(0, min(len(dt_values) - 1, math.ceil((pct / 100.0) * len(dt_values)) - 1))])
+    def percentile(values: list[float], percent: float) -> float | None:
+        if not values:
+            return None
+        index = max(0, min(len(values) - 1, math.ceil(percent / 100.0 * len(values)) - 1))
+        return values[index]
 
     missing_values: dict[str, int] = {}
+    non_finite_values: dict[str, int] = {}
+    invalid_numeric_values: dict[str, int] = {}
+    numeric_columns = {
+        "timestamp", *Q_VECTOR_COLUMNS, *QDOT_VECTOR_COLUMNS,
+        *CURRENT_VECTOR_COLUMNS, *QDDOT_VECTOR_COLUMNS,
+    }
     for column in fieldnames:
-        count = 0
+        absent = 0
+        non_finite = 0
         for row in rows:
-            value = row.get(column)
-            if value is None or value == "" or str(value).lower() == "nan":
-                count += 1
-        if count:
-            missing_values[column] = count
+            text = row.get(column)
+            if text is None or text.strip() == "":
+                absent += 1
+            elif column in numeric_columns and _safe_float(text) is None:
+                absent += 1
+                if text.strip().lower() in {"nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}:
+                    non_finite += 1
+                else:
+                    invalid_numeric_values[column] = invalid_numeric_values.get(column, 0) + 1
+        if absent:
+            missing_values[column] = absent
+        if non_finite:
+            non_finite_values[column] = non_finite
 
-    q_ranges: dict[str, dict[str, float]] = {}
-    velocity_ranges: dict[str, dict[str, float]] = {}
-    current_extrema: dict[str, dict[str, float]] = {}
-    acceleration_ranges: dict[str, dict[str, float]] = {}
+    def ranges(columns: list[str]) -> dict[str, dict[str, float | None]]:
+        result = {}
+        for column in columns:
+            values = [
+                value for row in rows
+                if (value := _safe_float(row.get(column))) is not None
+            ]
+            result[column] = {
+                "min": min(values) if values else None,
+                "max": max(values) if values else None,
+            }
+        return result
 
-    for i in range(1, 7):
-        q_key = f"q{i}"
-        qdot_key = f"qdot{i}"
-        current_key = f"current{i}"
-        qddot_key = f"qddot{i}"
-        q_values = [_safe_float(row.get(q_key)) for row in rows]
-        valid_q = [v for v in q_values if v is not None]
-        q_ranges[q_key] = {"min": min(valid_q) if valid_q else float("nan"), "max": max(valid_q) if valid_q else float("nan")}
+    metadata_values = {
+        key: sorted({str(row.get(key, "")).strip() for row in rows})
+        for key in METADATA_COLUMNS
+    }
+    metadata_consistency = {
+        key: len({value for value in values if value}) <= 1
+        for key, values in metadata_values.items()
+    }
+    metadata_missing = {
+        key: sum(not str(row.get(key, "")).strip() for row in rows)
+        for key in METADATA_COLUMNS
+    }
+    current_columns_present = all(column in fieldnames for column in CURRENT_VECTOR_COLUMNS)
+    incomplete_current_rows = sum(
+        any(_safe_float(row.get(column)) is None for column in CURRENT_VECTOR_COLUMNS)
+        for row in rows
+    )
+    all_zero_current_rows = sum(
+        all(_safe_float(row.get(column)) == 0.0 for column in CURRENT_VECTOR_COLUMNS)
+        for row in rows
+    )
+    repeated_current_values: dict[str, dict[str, int]] = {}
+    for column in CURRENT_VECTOR_COLUMNS:
+        previous = None
+        run_length = 0
+        longest_run = 0
+        repeated_count = 0
+        for row in rows:
+            current = _safe_float(row.get(column))
+            if current is not None and current == previous:
+                run_length += 1
+                repeated_count += 1
+                longest_run = max(longest_run, run_length + 1)
+            else:
+                run_length = 0
+            previous = current
+        repeated_current_values[column] = {
+            "adjacent_repeat_count": repeated_count,
+            "longest_identical_run": longest_run,
+        }
 
-        qdot_values = [_safe_float(row.get(qdot_key)) for row in rows]
-        valid_qdot = [v for v in qdot_values if v is not None]
-        velocity_ranges[qdot_key] = {"min": min(valid_qdot) if valid_qdot else float("nan"), "max": max(valid_qdot) if valid_qdot else float("nan")}
-
-        current_values = [_safe_float(row.get(current_key)) for row in rows]
-        valid_currents = [v for v in current_values if v is not None]
-        current_extrema[current_key] = {"min": min(valid_currents) if valid_currents else float("nan"), "max": max(valid_currents) if valid_currents else float("nan")}
-
-        if qddot_key in fieldnames:
-            qddot_values = [_safe_float(row.get(qddot_key)) for row in rows]
-            valid_qddot = [v for v in qddot_values if v is not None]
-            acceleration_ranges[qddot_key] = {"min": min(valid_qddot) if valid_qddot else float("nan"), "max": max(valid_qddot) if valid_qddot else float("nan")}
-
-    experiment_ids = sorted({row.get("experiment_id", "") for row in rows if row.get("experiment_id")})
-    trajectory_ids = sorted({row.get("trajectory_id", "") for row in rows if row.get("trajectory_id")})
-    run_ids = sorted({row.get("run_id", "") for row in rows if row.get("run_id")})
+    median_dt = statistics.median(dt_values) if dt_values else None
+    gap_limit = median_dt * 5.0 if median_dt is not None and median_dt > 0.0 else None
+    large_gaps = [value for value in dt_values if gap_limit is not None and value > gap_limit]
+    sample_rates = [1.0 / value for value in positive_dt]
+    sample_index_values = [_safe_float(row.get("sample_index")) for row in rows]
+    sample_index_gaps = sum(
+        current is not None and previous is not None and current - previous > 1
+        for previous, current in zip(sample_index_values, sample_index_values[1:])
+    )
+    malformed_row_count = sum(None in row for row in rows)
 
     report = {
-        "total_rows": total_rows,
-        "first_timestamp": timestamps[0] if timestamps else None,
-        "last_timestamp": timestamps[-1] if timestamps else None,
-        "monotonic": all((timestamps[idx] >= timestamps[idx - 1]) for idx in range(1, len(timestamps))),
-        "duplicate_timestamps": duplicate_timestamps,
-        "invalid_dt_values": invalid_dt_count,
-        "dt_min": dt_min,
-        "dt_max": dt_max,
-        "dt_mean": dt_mean,
-        "dt_median": dt_median,
-        "dt_percentiles": dt_percentiles,
-        "missing_values": missing_values,
-        "q_ranges": q_ranges,
-        "velocity_ranges": velocity_ranges,
-        "current_extrema": current_extrema,
-        "acceleration_ranges": acceleration_ranges,
-        "experiment_id_values": experiment_ids,
-        "trajectory_id_values": trajectory_ids,
-        "run_id_values": run_ids,
-        "metadata_values": {
-            key: sorted({row.get(key, "") for row in rows if row.get(key)})
-            for key in [
-                "commanded_speed",
-                "payload_g",
-                "contact_label",
-                "grasp_context",
-                "thermal_condition",
-            ]
+        "file_path": str(csv_path),
+        "total_rows": len(rows),
+        "duration_s": valid_timestamps[-1] - valid_timestamps[0] if len(valid_timestamps) > 1 else 0.0,
+        "first_timestamp": valid_timestamps[0] if valid_timestamps else None,
+        "last_timestamp": valid_timestamps[-1] if valid_timestamps else None,
+        "timestamp_monotonic": all(value >= 0.0 for value in dt_values),
+        "monotonic": all(value >= 0.0 for value in dt_values),
+        "duplicate_timestamp_values": len(duplicate_values),
+        "duplicate_timestamps": sum(value in duplicate_values for value in valid_timestamps),
+        "dt_nonpositive_count": sum(value <= 0.0 for value in dt_values),
+        "dt_negative_count": sum(value < 0.0 for value in dt_values),
+        "invalid_dt_values": sum(value <= 0.0 for value in dt_values),
+        "dt_min": min(dt_values) if dt_values else None,
+        "dt_median": median_dt,
+        "dt_mean": statistics.fmean(dt_values) if dt_values else None,
+        "dt_max": max(dt_values) if dt_values else None,
+        "dt_percentiles": {
+            f"P{percent}": percentile(dt_sorted, percent)
+            for percent in (1, 5, 95, 99)
         },
+        "approx_sample_rate_hz": {
+            "min": min(sample_rates) if sample_rates else None,
+            "median": statistics.median(sample_rates) if sample_rates else None,
+            "mean": statistics.fmean(sample_rates) if sample_rates else None,
+            "max": max(sample_rates) if sample_rates else None,
+            "interval_count": len(sample_rates),
+        },
+        "large_gap_count": len(large_gaps),
+        "large_gap_threshold_s_heuristic": gap_limit,
+        "large_gap_values_s": large_gaps,
+        "missing_values": missing_values,
+        "non_finite_values": non_finite_values,
+        "invalid_numeric_values": invalid_numeric_values,
+        "incomplete_current_rows": incomplete_current_rows,
+        "current_columns_present": current_columns_present,
+        "suspicious_all_zero_current_rows": all_zero_current_rows,
+        "repeated_current_values": repeated_current_values,
+        "q_ranges": ranges(Q_VECTOR_COLUMNS),
+        "velocity_ranges": ranges(QDOT_VECTOR_COLUMNS),
+        "current_extrema": ranges(CURRENT_VECTOR_COLUMNS),
+        "acceleration_ranges": ranges(QDDOT_VECTOR_COLUMNS),
+        "experiment_id_values": metadata_values["experiment_id"],
+        "trajectory_id_values": metadata_values["trajectory_id"],
+        "run_id_values": metadata_values["run_id"],
+        "metadata_values": metadata_values,
+        "metadata_consistency": metadata_consistency,
+        "metadata_inconsistent": not all(metadata_consistency.values()),
+        "metadata_missing_rows": metadata_missing,
+        "sample_index_gap_count": sample_index_gaps,
+        "malformed_row_count": malformed_row_count,
         "schema_summary": {
             "required_columns": required_columns,
+            "optional_columns": QDDOT_VECTOR_COLUMNS + ["sample_index"],
             "missing_columns": missing_columns,
             "units": {
-                "timestamp": "seconds (monotonic perf_counter / CRI receive timestamp)",
-                "q1..q6": "degrees",
-                "qdot1..q6": "deg/s (finite-difference derivative of q)",
-                "current1..current6": "mA",
-                "qddot1..qddot6": "deg/s^2 (candidate derivative, if available)",
+                "timestamp": "seconds from host monotonic clock at CRI STATUS reception",
+                "sample_index": "zero-based receive-callback sample sequence",
+                "q1..q6": "degrees (raw CRI STATUS POSJOINTCURRENT)",
+                "qdot1..q6": "deg/s (derived using measured timestamp delta)",
+                "current1..current6": "mA (raw CRI STATUS CURRENTJOINTS)",
+                "qddot1..qddot6": "deg/s^2 (candidate derived signal)",
             },
-            "notes": "No verified current clipping limit was found in the repository; observed extrema are reported without inventing a limit.",
+            "notes": "No verified current clipping limit was found; extrema are reported and clipping limit is unknown.",
         },
         "current_limit_verified": False,
-        "current_extrema_summary": {
-            key: {
-                "min": values["min"],
-                "max": values["max"],
-            }
-            for key, values in current_extrema.items()
-        },
+        "current_clipping_limit": "unknown; no verified repository/manufacturer limit configured",
     }
+    report["quality_status"] = _quality_status(report, 0, None)
     return report
 
 
 def _print_report(report: dict[str, Any]) -> None:
-    print("Identification CSV quality summary")
-    print("=" * 36)
-    print(f"total_rows: {report['total_rows']}")
-    print(f"start_timestamp: {report['first_timestamp']}")
-    print(f"end_timestamp: {report['last_timestamp']}")
-    print(f"monotonic: {report['monotonic']}")
-    print(f"duplicate_timestamps: {report['duplicate_timestamps']}")
-    print(f"invalid_dt_values: {report['invalid_dt_values']}")
-    print(f"dt_min: {report['dt_min']}")
-    print(f"dt_max: {report['dt_max']}")
-    print(f"dt_mean: {report['dt_mean']}")
-    print(f"dt_median: {report['dt_median']}")
-    print(f"dt_percentiles: {report['dt_percentiles']}")
-    print(f"missing_values: {report['missing_values']}")
-    print(f"experiment_id_values: {report['experiment_id_values']}")
-    print(f"trajectory_id_values: {report['trajectory_id_values']}")
-    print(f"run_id_values: {report['run_id_values']}")
-    print(f"current_limit_verified: {report['current_limit_verified']}")
+    print(f"{report['quality_status']}: {report['file_path']}")
+    print(f"rows: {report['total_rows']} | duration_s: {report['duration_s']}")
+    print(
+        "timestamps: "
+        f"monotonic={report['timestamp_monotonic']} "
+        f"duplicates={report['duplicate_timestamps']} "
+        f"dt<=0={report['dt_nonpositive_count']} "
+        f"dt_s[min/median/mean/max]={report['dt_min']}/{report['dt_median']}/"
+        f"{report['dt_mean']}/{report['dt_max']}"
+    )
+    print(f"dt_percentiles_s: {report['dt_percentiles']}")
+    print(f"approx_sample_rate_hz: {report['approx_sample_rate_hz']}")
+    print(f"missing_or_nonfinite_by_column: {report['missing_values']}")
+    print(f"non_finite_by_column: {report['non_finite_values']}")
+    print(f"invalid_numeric_by_column: {report['invalid_numeric_values']}")
+    print(f"incomplete_current_rows: {report['incomplete_current_rows']}")
+    print(f"current_columns_present: {report['current_columns_present']}")
+    print(f"q_ranges: {report['q_ranges']}")
+    print(f"qdot_ranges: {report['velocity_ranges']}")
+    print(f"current_ranges_mA: {report['current_extrema']}")
+    print(f"qddot_ranges: {report['acceleration_ranges']}")
+    print(f"metadata_consistency: {report['metadata_consistency']}")
+    print(f"metadata_values: {report['metadata_values']}")
+    print(f"all_zero_current_rows: {report['suspicious_all_zero_current_rows']}")
+    print(f"repeated_current_values: {report['repeated_current_values']}")
+    print(f"large_gaps: {report['large_gap_values_s']} (heuristic threshold: {report['large_gap_threshold_s_heuristic']} s)")
+    print(f"sample_index_gap_count: {report['sample_index_gap_count']}")
+    print(f"current_clipping_limit: {report['current_clipping_limit']}")
     print(f"schema_summary: {report['schema_summary']}")
 
 

@@ -48,6 +48,40 @@ class PathWorkflowTests(unittest.TestCase):
     def test_path_execution_has_no_final_position_tolerance_poll(self):
         self.assertFalse(hasattr(RebelManager, "_wait_for_position"))
 
+    def test_trajectory_parser_supports_phase_csv(self):
+        executor = PathExecutor()
+        with tempfile.TemporaryDirectory() as temp_directory:
+            file_path = Path(temp_directory) / "trajectory.csv"
+            file_path.write_text(
+                "Phase,Step,J1 (deg),J2 (deg),J3 (deg),J4 (deg),J5 (deg),J6 (deg),Velocity (%)\n"
+                "PREPARATION,0,10,20,30,40,50,60,35\n"
+                "TASK,1,11,21,31,41,51,61,35\n"
+                "TASK,2,12,22,32,42,52,62,35\n",
+                encoding="utf-8",
+            )
+            plan = executor.load_trajectory_csv(file_path)
+
+        self.assertEqual(plan.start_angles, [10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+        self.assertEqual(plan.task_waypoints[0], [11.0, 21.0, 31.0, 41.0, 51.0, 61.0])
+        self.assertEqual(plan.task_waypoints[-1], [12.0, 22.0, 32.0, 42.0, 52.0, 62.0])
+        self.assertEqual(plan.velocity_percent, 35.0)
+
+    def test_trajectory_parser_supports_legacy_step_cri_format(self):
+        executor = PathExecutor()
+        with tempfile.TemporaryDirectory() as temp_directory:
+            file_path = Path(temp_directory) / "legacy.csv"
+            file_path.write_text(
+                "Step,CRI Command\n"
+                "0,CMD Move Joint 1 2 3 4 5 6 0 0 0 35\n"
+                "1,CMD Move Joint 2 3 4 5 6 7 0 0 0 35\n",
+                encoding="utf-8",
+            )
+            plan = executor.load_trajectory_csv(file_path)
+
+        self.assertEqual(plan.start_angles, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        self.assertEqual(plan.task_waypoints, [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]])
+        self.assertEqual(plan.velocity_percent, 35.0)
+
 
 if __name__ == "__main__":
     unittest.main()

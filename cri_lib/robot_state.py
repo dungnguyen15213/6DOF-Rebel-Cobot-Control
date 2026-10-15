@@ -240,8 +240,8 @@ class RobotState:
     current_total = 0.0
     """total current drawn by robot"""
 
-    current_joints: list[float] = field(default_factory=lambda: [0.0] * 16)
-    """current drawn by individual axes"""
+    current_joints: list[float] = field(default_factory=lambda: [float("nan")] * 16)
+    """Current drawn by individual axes; NaN means telemetry is unavailable."""
 
     kinematics_state: KinematicsState = KinematicsState.MOTION_NOT_ALLOWED
     """global kinematics state"""
