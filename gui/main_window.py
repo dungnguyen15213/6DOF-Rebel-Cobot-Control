@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import logging
 import threading
 from pathlib import Path
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -975,6 +976,7 @@ class MainWindow(QMainWindow):
                 )
                 logger = self.identification_logger
             self.identification_output_path = str(logger.file_path)
+            self._identification_frame_stats_start = self._frame_stats_snapshot()
             self.identification_last_summary = None
             self._identification_last_timestamp = None
             self._identification_last_q = None
@@ -992,6 +994,12 @@ class MainWindow(QMainWindow):
                 f"Writing raw telemetry to:\n{logger.file_path}",
             )
         return True
+
+    def _frame_stats_snapshot(self):
+        try:
+            return self.manager.robot.frame_stats()
+        except Exception:
+            return None
 
     def _confirm_identification_condition(self, metadata):
         is_normal_no_load = (
@@ -1025,8 +1033,12 @@ class MainWindow(QMainWindow):
             self._identification_last_timestamp = None
             self._identification_last_q = None
             self._identification_last_qdot = None
-        summary = logger.close()
+        end_stats = self._frame_stats_snapshot()
+        start_stats = getattr(self, "_identification_frame_stats_start", None)
+        accounting = {"start": start_stats, "end": end_stats}
+        summary = logger.close(frame_accounting=accounting)
         self.identification_last_summary = summary
+        self._start_post_run_report(logger.file_path)
         if not silent:
             self.btn_start_identification.setEnabled(self.manager.robot.connected)
             self.btn_stop_identification.setEnabled(False)
@@ -1040,6 +1052,18 @@ class MainWindow(QMainWindow):
                 f"Quality sidecar: {logger.summary_path}",
             )
         return summary
+
+    def _start_post_run_report(self, csv_path):
+        # Report failure must never affect the already-saved raw CSV.
+        def worker():
+            try:
+                from core.run_report import generate_run_report
+
+                generate_run_report(csv_path)
+            except Exception:
+                logging.getLogger(__name__).exception("Post-run report failed")
+
+        threading.Thread(target=worker, name="post-run-report", daemon=True).start()
 
     def _show_identification_close_summary(self, summary):
         file_path = summary.get("file_path", self.identification_output_path or "")

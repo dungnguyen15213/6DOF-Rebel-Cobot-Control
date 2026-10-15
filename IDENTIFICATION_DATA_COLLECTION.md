@@ -162,3 +162,16 @@ Columns appended after the metadata columns:
 Live `qdot`/`qddot` are derived values, not measurements. They are computed only between `UNIQUE`/`BATCH_LAST` rows with `dt > 0` of the same `connection_epoch`; `BATCH_EARLIER` rows get `nan`. Raw `q`, `current` and `timestamp` are never modified. Use `core.identification_audit.build_processed_dataset` for offline filtered velocity; the raw CSV stays the source of truth.
 
 Quality rules: with provenance, labelled batching gives a WARNING (the audit also FAILs if labels contradict the timestamps or usable rows repeat a timestamp). Legacy files without provenance (e.g. RUN_01/RUN_02 from 2026-10-15) still FAIL on duplicate timestamps because batching cannot be verified. Current is `nan` unless `CURRENTJOINTS` was present in that very STATUS message, so initialised defaults and stale values are never logged as measurements; a genuine measured `0` is logged as `0`.
+
+## RUN_03 procedure and post-run reporting
+
+Before RUN_03 the operator must confirm that the trajectory is still safe and approved. Use the same `Pathways/trajectory_export.csv` (28 waypoints), unchanged speed, a new unique run ID, payload 0 g, NORMAL, grasp context NONE, and a real thermal label. Do not move the robot automatically.
+
+When a run is stopped, the raw CSV and `.csv.json` sidecar are saved first; a background thread then writes `reports/identification_runs/<run_id>/` (`RUN_AUDIT.md/json`, `timing_diagnostics.csv`, three plots, `run_manifest.json`). Report failures never affect the raw CSV. Manual commands:
+
+```powershell
+& .\.venv\Scripts\python.exe -m core.run_report <identification.csv>
+& .\.venv\Scripts\python.exe tools\export_identification_handoff.py --run <identification.csv>
+```
+
+New CSV column `status_frame_counter` counts STATUS frames only; `frame_counter` counts all frame types. The sidecar adds `logger_accounting`, `frame_accounting` (start/end per-type counters) and `live_derivative_policy` (live qdot/qddot are NaN when the receive interval is below 10 ms; heuristic, derived values are not ground truth).

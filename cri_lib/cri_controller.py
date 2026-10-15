@@ -11,7 +11,7 @@ from typing import Any, Callable
 from core.latency_tracking import NetworkLatencyTracker
 from .cri_errors import CRICommandTimeOutError, CRIConnectionError
 from .cri_protocol_parser import CRIProtocolParser
-from .frame_timing import FrameTimer, FrameTiming, extract_frames
+from .frame_timing import FrameTimer, FrameTiming, extract_frames, message_type
 from .robot_state import KinematicsState, RobotState
 
 logger = logging.getLogger(__name__)
@@ -300,9 +300,23 @@ class CRIController:
         if not frames:
             return
         chunk_id = self.frame_timer.begin_chunk()
-        for index, message in enumerate(frames):
-            timing = self.frame_timer.stamp_frame(chunk_id, index, len(frames), t_chunk_rx)
-            self._parse_message(message, t_chunk_rx, timing)
+        types = [message_type(frame) for frame in frames]
+        status_total = types.count("STATUS")
+        status_index = 0
+        for message, kind in zip(frames, types):
+            frame_counter = self.frame_timer.note_frame(kind)
+            timing = None
+            if kind == "STATUS":
+                timing = self.frame_timer.stamp_frame(
+                    chunk_id, status_index, status_total, t_chunk_rx, frame_counter
+                )
+                status_index += 1
+            try:
+                self._parse_message(message, t_chunk_rx, timing)
+            except Exception:
+                # A malformed frame must not stop the receive thread.
+                self.frame_timer.parse_errors += 1
+                logger.exception("Failed to parse CRI %s frame", kind)
 
     def _wait_for_answer(
         self,
@@ -376,8 +390,10 @@ class CRIController:
                 self.last_status_timing = timing
             if answer_id == "status" and self.status_callback is not None:
                 try:
+                    self.frame_timer.status_callbacks += 1
                     self.status_callback(self.robot_state, received_at)
                 except Exception:
+                    self.frame_timer.status_callback_errors += 1
                     logger.exception("Status callback failed")
 
             if isinstance(answer_id, str) and answer_id.isdigit():
@@ -415,6 +431,10 @@ class CRIController:
         """
         self._register_answer("status")
         self._wait_for_answer("status", timeout)
+
+    def frame_stats(self) -> dict:
+        """Snapshot of per-type frame and callback counters."""
+        return self.frame_timer.stats()
 
     def register_status_callback(
         self, callback: Callable[[RobotState, float], None] | None

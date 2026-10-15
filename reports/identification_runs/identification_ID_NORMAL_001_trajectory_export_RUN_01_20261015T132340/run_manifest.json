@@ -1,0 +1,18 @@
+{
+  "run_id": "identification_ID_NORMAL_001_trajectory_export_RUN_01_20261015T132340",
+  "source_file": "D:\\01_VGU\\03_IHMS\\03_Project\\06_6DOFCobotController\\identification_data\\identification_ID_NORMAL_001_trajectory_export_RUN_01_20261015T132340.csv",
+  "source_sha256": "e56e8fc70d96437a73effafe8dc6ebc87e7270f7110f660815f096805623f9b7",
+  "files": [
+    "RUN_AUDIT.json",
+    "RUN_AUDIT.md",
+    "derivative_quality_plot.png",
+    "joint_current_plot.png",
+    "joint_position_plot.png",
+    "timing_diagnostics.csv"
+  ],
+  "plots": [
+    "joint_position_plot.png",
+    "joint_current_plot.png",
+    "derivative_quality_plot.png"
+  ]
+}

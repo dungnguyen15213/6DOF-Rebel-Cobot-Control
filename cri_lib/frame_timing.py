@@ -38,6 +38,7 @@ class FrameTiming:
     frames_in_chunk: int
     t_chunk_rx_s: float
     t_frame_s: float
+    status_counter: int = -1
 
     @property
     def timing_class(self) -> str:
@@ -82,17 +83,30 @@ def extract_frames(buffer: bytearray) -> tuple[list[str], int]:
 
 
 class FrameTimer:
-    """Assigns provenance to frames; not thread-safe (receive thread only)."""
+    """Counts every complete CRI frame and assigns STATUS provenance.
+
+    Not thread-safe: use from the receive thread only (read snapshots via ``stats``).
+    ``frame_counter`` counts all frame types, so it legitimately skips numbers
+    between STATUS frames; ``status_counter`` counts STATUS frames only, and a
+    gap there means a STATUS frame that was not delivered to the identification
+    path (e.g. a parse failure), not a non-STATUS message.
+    """
 
     def __init__(self) -> None:
         self.connection_epoch = 0
         self.frame_counter = 0
+        self.status_counter = 0
         self.chunk_id = 0
         self.discarded_frames = 0
+        self.frame_type_counts: dict[str, int] = {}
+        self.parse_errors = 0
+        self.status_callbacks = 0
+        self.status_callback_errors = 0
 
     def restart_connection(self) -> None:
         self.connection_epoch += 1
         self.frame_counter = 0
+        self.status_counter = 0
         self.chunk_id = 0
 
     def begin_chunk(self) -> int:
@@ -100,18 +114,56 @@ class FrameTimer:
         self.chunk_id += 1
         return chunk_id
 
+    def note_frame(self, message_type: str) -> int:
+        """Count one complete frame of any type; returns its ``frame_counter``."""
+        self.frame_type_counts[message_type] = self.frame_type_counts.get(message_type, 0) + 1
+        index = self.frame_counter
+        self.frame_counter += 1
+        return index
+
     def stamp_frame(
-        self, chunk_id: int, frame_in_chunk: int, frames_in_chunk: int, t_chunk_rx_s: float
+        self,
+        chunk_id: int,
+        frame_in_chunk: int,
+        frames_in_chunk: int,
+        t_chunk_rx_s: float,
+        frame_counter: int | None = None,
     ) -> FrameTiming:
-        """Build provenance when the frame starts processing (sets ``t_frame_s``)."""
+        """Build STATUS provenance when parsing starts (sets ``t_frame_s``).
+
+        ``frame_in_chunk``/``frames_in_chunk`` count STATUS frames only, because
+        only STATUS frames become identification rows that share a timestamp.
+        """
+        if frame_counter is None:
+            frame_counter = self.note_frame("STATUS")
         timing = FrameTiming(
             connection_epoch=self.connection_epoch,
-            frame_counter=self.frame_counter,
+            frame_counter=frame_counter,
             chunk_id=chunk_id,
             frame_in_chunk=frame_in_chunk,
             frames_in_chunk=frames_in_chunk,
             t_chunk_rx_s=t_chunk_rx_s,
             t_frame_s=perf_counter(),
+            status_counter=self.status_counter,
         )
-        self.frame_counter += 1
+        self.status_counter += 1
         return timing
+
+    def stats(self) -> dict:
+        """Cumulative counters since the controller was created (copy-safe)."""
+        return {
+            "connection_epoch": self.connection_epoch,
+            "frames_total": sum(self.frame_type_counts.values()),
+            "status_frames": self.frame_type_counts.get("STATUS", 0),
+            "frame_type_counts": dict(self.frame_type_counts),
+            "discarded_frames": self.discarded_frames,
+            "parse_errors": self.parse_errors,
+            "status_callbacks": self.status_callbacks,
+            "status_callback_errors": self.status_callback_errors,
+        }
+
+
+def message_type(frame: str) -> str:
+    """Return the CRI message type token of a complete frame, or ``UNKNOWN``."""
+    parts = frame.split(None, 3)
+    return parts[2] if len(parts) > 2 else "UNKNOWN"

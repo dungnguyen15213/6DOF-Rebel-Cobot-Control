@@ -1,0 +1,130 @@
+# Run audit: identification_ID_NORMAL_001_trajectory_export_RUN_01_20261015T132340
+
+Readiness: **NOT READY**
+
+## Decisions
+
+- **A_raw_telemetry_integrity**: WARNING - channels exactly zero on every row: ['J6']; may be an unmoved/unloaded joint or a missing field (hardware check needed)
+- **B_timestamp_provenance**: FAIL - host receive time only; no device timestamp exists in CRI STATUS frames; batched rows share a timestamp
+- **C_model_A_offline**: WARNING - Model A (position/velocity-light, one sample per unique timestamp) usable offline only if currents are valid; excitation not assessed here
+- **C_model_B_live_derivatives**: NOT VERIFIED - no chunk timing
+
+## Timing
+
+```json
+{
+  "rows": 630,
+  "unique_timestamps": 421,
+  "rows_sharing_timestamp": 209,
+  "unique_chunks": 0,
+  "timing_class_counts": {
+    "": 630
+  }
+}
+```
+
+## Current freshness
+
+```json
+{
+  "J1": {
+    "finite": 630,
+    "exact_zero": 8,
+    "value_changes": 604,
+    "unique_values": 374
+  },
+  "J2": {
+    "finite": 630,
+    "exact_zero": 33,
+    "value_changes": 592,
+    "unique_values": 358
+  },
+  "J3": {
+    "finite": 630,
+    "exact_zero": 22,
+    "value_changes": 600,
+    "unique_values": 159
+  },
+  "J4": {
+    "finite": 630,
+    "exact_zero": 0,
+    "value_changes": 309,
+    "unique_values": 3
+  },
+  "J5": {
+    "finite": 630,
+    "exact_zero": 33,
+    "value_changes": 586,
+    "unique_values": 307
+  },
+  "J6": {
+    "finite": 630,
+    "exact_zero": 630,
+    "value_changes": 0,
+    "unique_values": 1
+  }
+}
+```
+
+## Detailed audit
+
+```
+IDENTIFICATION RUN AUDIT: FAIL
+source: D:\01_VGU\03_IHMS\03_Project\06_6DOFCobotController\identification_data\identification_ID_NORMAL_001_trajectory_export_RUN_01_20261015T132340.csv
+sha256: e56e8fc70d96437a73effafe8dc6ebc87e7270f7110f660815f096805623f9b7
+
+Conclusions
+  basic csv readability        PASS
+  logger signal integrity      FAIL
+  initial 0g dry test          FAIL
+  full six joint campaign      FAIL
+  data use: not usable for identification until the failed criteria are resolved
+
+Criteria
+  [PASS        ] R1 CSV parses and has data rows
+      "630 data rows"
+  [PASS        ] R2 Required columns present
+      "all required columns present"
+  [PASS        ] R3 No malformed or truncated rows
+      {"malformed_rows": 0, "final_line_terminated": true}
+  [PASS        ] I1 Metadata constant for the whole run
+      {"inconsistent": {}, "empty_fields": [], "values": {"experiment_id": ["ID_NORMAL_001"], "trajectory_id": ["trajectory_export"], "run_id": ["RUN_01"], "commanded_speed": ["50.0"], "payload_g": ["0.0"], "contact_label": ["NORMAL"], "grasp_context": ["NONE"], "thermal_condition": ["COLD"]}}
+  [PASS        ] I2 Experiment conditions match configured expectation
+      {"expected": {"payload_g": 0.0, "contact_label": "NORMAL", "grasp_context": "NONE"}, "mismatches": {}}
+  [PASS        ] I3 Thermal condition declared
+      {"reported": ["COLD"], "note": "operator-declared label; no temperature signal is verified by this audit"}
+  [PASS        ] I4 q and current are finite for every row
+      {"bad_columns": {}, "timestamp_issues": {"missing": 0, "nonfinite": 0, "invalid": 0}}
+  [WARNING     ] I5 Current telemetry is fresh (no initialized or partially zeroed rows)
+      {"all_zero_rows": 0, "leading_all_zero_rows": 0, "rows_with_many_zero_channels": 22, "many_zero_channel_threshold": 3, "first_last_such_row": [21, 628], "rule": "leading all-zero rows match RobotState zero initialization; simultaneous exact zeros on several channels cannot be separated from genuine idle current using the CSV alone"}
+  [WARNING     ] I6 No flat, frozen, or all-zero current channel
+      {"current6": ["constant", "identical run of 630/630 samples", "all zero"]}
+  [NOT VERIFIED] I7 Current clipping
+      {"note": "no documented current limit; extremum repeats are reported, not judged", "repeated_extrema": {"current1": {"samples_at_max": 1, "samples_at_min": 8, "min_mA": 0.0, "max_mA": 683.0}, "current2": {"samples_at_max": 1, "samples_at_min": 33, "min_mA": 0.0, "max_mA": 703.0}, "current3": {"samples_at_max": 1, "samples_at_min": 22, "min_mA": 0.0, "max_mA": 805.0}, "current4": {"samples_at_max": 178, "samples_at_min": 24, "min_mA": 7.0, "max_mA": 9.0}, "current5": {"samples_at_max": 1, "samples_at_min": 33, "min_mA": 0.0, "max_mA": 680.0}, "current6": {"samples_at_max": 630, "samples_at_min": 630, "min_mA": 0.0, "max_mA": 0.0}}}
+  [PASS        ] T1 Timestamps never decrease
+      {"negative_dt": 0}
+  [FAIL        ] T2 Timestamps are unique (one STATUS per host timestamp)
+      {"timing_provenance": "absent (legacy recording: batching cannot be verified)", "dt_zero_count": 209, "dt_zero_fraction": 0.3322734499205087, "fail_above_fraction": 0.05, "cause": "several STATUS messages parsed from one socket read share its receive time; samples are distinct but their true spacing is unknown"}
+  [PASS        ] T3 No unexpected recording gaps
+      {"gap_count": 0, "gap_limit_s": 0.2297252500011382, "largest_gap_s": null}
+  [PASS        ] T4 sample_index is contiguous
+      {"discontinuities": 0}
+  [PASS        ] T5 Effective sampling rate measured
+      {"rows": 630, "duration_s": 17.191002600000502, "message_rate_hz": 36.588907269433, "unique_timestamp_rate_hz": 24.431384822196918, "unique_timestamp_count": 421}
+  [PASS        ] L1 Logger writer reported no drops or errors
+      {"dropped": 0, "writer_error": null, "logger_quality_status": "FAIL"}
+
+Sampling
+  rows=630 duration_s=17.191 message_rate_hz=36.588907269433 unique_timestamp_rate_hz=24.431384822196918
+
+Per-joint coverage (q deg, current mA; derived from last row of each timestamp batch)
+  J1: LIMITED       q[-0.00,48.01] range=48.01 travel+/-=48.01/-0.00 speed[0.00,160.88] current[0,683] std=146.7 moving_fraction=0.85
+  J2: LIMITED       q[-40.21,-11.45] range=28.76 travel+/-=28.76/-0.00 speed[0.00,91.93] current[0,703] std=160.9 moving_fraction=0.76
+  J3: LIMITED       q[102.04,114.99] range=12.95 travel+/-=12.95/-0.00 speed[0.00,68.95] current[0,805] std=161.0 moving_fraction=0.35
+  J4: NOT EXERCISED q[-0.00,-0.00] range=0.00 travel+/-=0.00/-0.00 speed[0.00,0.00] current[7,9] std=0.5 moving_fraction=0.00
+  J5: LIMITED       q[65.96,69.55] range=3.59 travel+/-=0.00/3.59 speed[-22.98,0.00] current[0,680] std=128.9 moving_fraction=0.02
+  J6: NOT EXERCISED q[-0.00,-0.00] range=0.00 travel+/-=0.00/-0.00 speed[0.00,0.00] current[0,0] std=0.0 moving_fraction=0.00
+
+A single run never certifies the identification campaign; the plan requires 10-15 trajectory recipes with independent repeats.
+
+```

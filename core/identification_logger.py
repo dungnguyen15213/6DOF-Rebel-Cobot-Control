@@ -38,7 +38,14 @@ TIMING_COLUMNS = [
     "frames_in_chunk",
     "t_frame_s",
     "timing_class",
+    "status_frame_counter",
 ]
+
+# Live derivatives need receive intervals at least this long. Shorter intervals
+# are host-scheduling artefacts (RUN_02: 0.2 ms between reads), not sampling
+# intervals, and would turn quantisation steps into huge velocities. Heuristic,
+# not a robot specification; the raw CSV is unaffected.
+MIN_DERIVATIVE_DT_S = 0.01
 
 IDENTIFICATION_COLUMNS = [
     "timestamp",
@@ -66,6 +73,7 @@ def _timing_fields(frame_timing: Any) -> dict[str, Any]:
         "frames_in_chunk": frame_timing.frames_in_chunk,
         "t_frame_s": repr(float(frame_timing.t_frame_s)),
         "timing_class": frame_timing.timing_class,
+        "status_frame_counter": frame_timing.status_counter,
     }
 
 
@@ -185,6 +193,9 @@ class IdentificationLogger:
         self._next_sample_index = 0
         self.row_count = 0
         self.dropped_sample_count = 0
+        self.samples_offered = 0
+        self.samples_q_complete = 0
+        self.samples_current_complete = 0
         self.writer_error: str | None = None
         self._first_timestamp: float | None = None
         self._last_timestamp: float | None = None
@@ -233,6 +244,9 @@ class IdentificationLogger:
                 return
             sample_index = self._next_sample_index
             self._next_sample_index += 1
+            self.samples_offered += 1
+            self.samples_q_complete += all(math.isfinite(v) for v in sample_q)
+            self.samples_current_complete += all(math.isfinite(v) for v in sample_current)
             try:
                 self._queue.put_nowait(
                     (sample_index, sample_timestamp, sample_q, sample_current, timing_fields)
@@ -271,7 +285,8 @@ class IdentificationLogger:
                     else float("nan")
                 )
                 # Earlier frames of a multi-frame read have no distinct measured time.
-                if usable and previous_q is not None and math.isfinite(dt) and dt > 0.0:
+                dt_ok = usable and math.isfinite(dt) and dt >= MIN_DERIVATIVE_DT_S
+                if dt_ok and previous_q is not None:
                     qdot_values = [
                         (q_values[index] - previous_q[index]) / dt
                         if math.isfinite(q_values[index]) and math.isfinite(previous_q[index])
@@ -281,7 +296,7 @@ class IdentificationLogger:
                 else:
                     qdot_values = [float("nan")] * 6
 
-                if usable and previous_qdot is not None and math.isfinite(dt) and dt > 0.0:
+                if dt_ok and previous_qdot is not None:
                     qddot_values = [
                         (qdot_values[index] - previous_qdot[index]) / dt
                         if math.isfinite(qdot_values[index]) and math.isfinite(previous_qdot[index])
@@ -334,7 +349,7 @@ class IdentificationLogger:
         finally:
             self._file.close()
 
-    def close(self) -> dict[str, Any] | None:
+    def close(self, frame_accounting: dict[str, Any] | None = None) -> dict[str, Any] | None:
         with self._close_lock:
             if self._closed:
                 return self._summary
@@ -371,6 +386,18 @@ class IdentificationLogger:
                     "qddot": "candidate derived signal; unavailable until sufficient samples exist",
                 },
                 "writer_dropped_sample_count": self.dropped_sample_count,
+                "logger_accounting": {
+                    "samples_offered_to_logger": self.samples_offered,
+                    "samples_with_complete_q": self.samples_q_complete,
+                    "samples_with_complete_current": self.samples_current_complete,
+                    "rows_written": self.row_count,
+                    "dropped_by_queue_or_writer": self.dropped_sample_count,
+                },
+                "frame_accounting": frame_accounting,
+                "live_derivative_policy": {
+                    "min_dt_s": MIN_DERIVATIVE_DT_S,
+                    "rule": "qdot/qddot are NaN (unavailable, not zero) for BATCH_EARLIER rows, dt < min_dt_s, or non-finite inputs; they are derived, never ground truth",
+                },
                 "writer_error": self.writer_error,
                 "quality_status": status,
                 "quality_report": report,

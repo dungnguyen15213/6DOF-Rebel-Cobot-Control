@@ -1,0 +1,16 @@
+﻿
+ M IDENTIFICATION_DATA_COLLECTION.md
+ M core/identification_logger.py
+ M cri_lib/cri_controller.py
+ M cri_lib/frame_timing.py
+ M gui/main_window.py
+?? core/run_report.py
+?? identification_data/identification_ID_NORMAL_001_trajectory_export_RUN_01_20261015T132340.csv
+?? identification_data/identification_ID_NORMAL_001_trajectory_export_RUN_01_20261015T132340.csv.json
+?? identification_data/identification_ID_NORMAL_002_trajectory_export_RUN_02_20261015T133850.csv
+?? identification_data/identification_ID_NORMAL_002_trajectory_export_RUN_02_20261015T133850.csv.json
+?? reports/
+?? tests/test_run_report.py
+?? tools/export_identification_handoff.py
+
+
