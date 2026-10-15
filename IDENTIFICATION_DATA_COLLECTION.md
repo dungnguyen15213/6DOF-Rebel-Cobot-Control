@@ -115,3 +115,31 @@ These are acquisition-integrity checks only. They do not define anomaly threshol
 Keep each physical execution in its own file. For an initial conservative campaign, repeat safe excitation patterns with distinct `run_id` values, including positive and negative motion for individual joints, multiple operator-selected safe commanded speeds, and representative multi-joint paths. Reuse `trajectory_id` for the same path and change `run_id` for every execution. Use the robot/controller's established limits; this guide does not prescribe joint limits or safe speeds. Later offline validation should hold out entire run IDs, not randomly split samples from a run.
 
 Keep the CSV, its JSON sidecar, the exact trajectory/path artifact, the quality-check output, and notes on the physical setup/thermal label together for every run. Do not begin longer collection until the 30–120 second dry test confirms real current availability, realistic timestamp spacing, no unexplained missing samples, and no unacceptable effect on CRI receive timing.
+
+## Audit, Processed Dataset, and Dry-Lab Workflow
+
+After every run, audit it before trusting it:
+
+```powershell
+.\.venv\Scripts\python.exe tools\audit_identification_run.py identification_data\<run-file>.csv --no-plots
+# optional: --diagnostics robot_diagnostics.csv  --processed  --smoothing-window 5
+```
+
+Reports go to `audit_reports\<run-file>\` (`audit_report.json`, `audit_report.txt`, plots if matplotlib is installed). Exit code: 0 PASS/WARNING, 1 FAIL, 2 file/usage error. Raw CSVs are never modified. Criteria cover readability, metadata, finite q/current, stale/zeroed current rows, timestamp uniqueness/gaps, per-joint excitation (range and both directions), and logger drop counters. Clipping is reported NOT VERIFIED unless a current limit is documented. All thresholds are configurable heuristics in `AuditConfig`, not scientific limits.
+
+**Timestamp caveat.** The timestamp is the host receive time of one socket read. Several STATUS messages parsed from one read share it (`dt == 0`); their true spacing is unrecoverable and is not fabricated. A run with more than 5% duplicate timestamps FAILs T2. Derivatives and the processed dataset use only the last row of each identical-timestamp batch.
+
+**Processed dataset** (`--processed`, only written when the audit does not FAIL): SI-unit CSV (rad, rad/s, A) plus `.provenance.json`, with flags `flag_duplicate_timestamp`, `flag_current_invalid`, `flag_use_for_derivatives`, `batch_size`, `batch_position`. Live `qddot` is ignored; boundary derivative rows stay NaN. `core.identification_audit.model_features` builds Model A/B design matrices (no fitting), and `whole_run_holdout_splits` splits by run ID.
+
+**Merging `robot_diagnostics.csv`** is refused (UNSUPPORTED): it has no `run_id`, uses an execution-relative `Time (s)` instead of the host clock, and is GUI-sampled. Do not align by guessing.
+
+**Conservative 0 g dry-lab sequence**
+1. Check workspace and E-stop; no payload, no intended contact.
+2. Connect; confirm fresh telemetry (currents changing).
+3. Confirm payload/contact/grasp/thermal labels in Identification Settings.
+4. Record 30–60 s stationary.
+5. Run one operator-approved low-speed bidirectional trajectory.
+6. Stop & Save; close cleanly.
+7. Run the audit immediately.
+8. Reject or investigate any FAIL; do not repair raw data.
+9. Only then begin the 10–15 trajectory campaign with distinct `run_id`s, including J4/J6 and both directions on every joint.
