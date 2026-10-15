@@ -143,3 +143,22 @@ Reports go to `audit_reports\<run-file>\` (`audit_report.json`, `audit_report.tx
 7. Run the audit immediately.
 8. Reject or investigate any FAIL; do not repair raw data.
 9. Only then begin the 10–15 trajectory campaign with distinct `run_id`s, including J4/J6 and both directions on every joint.
+
+## Timestamp Provenance (CRI Frame Timing)
+
+CRI STATUS frames carry no device timestamp or sequence number (the `Time` field exists only in CAN-bridge messages), so timing comes from the host `perf_counter()`. One TCP `recv()` can deliver several complete frames (RUN_01: 209 of 629 intervals had `dt = 0`, i.e. batched frames sharing one receive time). The receive loop therefore keeps `timestamp` = receive time of the read that completed the frame and labels each frame instead of inventing spacing. Rows from a multi-frame read share `timestamp`; their true sampling instants are unknown and are never reconstructed or epsilon-adjusted.
+
+Columns appended after the metadata columns:
+
+| Column | Meaning |
+|---|---|
+| `connection_epoch` | Increments on every (re)connect; counters below restart. |
+| `frame_counter` | Complete STATUS frames in order within the epoch (gaps are impossible unless `sample_index` also gaps). |
+| `rx_chunk_id` | Index of the TCP read within the epoch. |
+| `frame_in_chunk` / `frames_in_chunk` | Position and size of the batch for this read. |
+| `t_frame_s` | `perf_counter()` when frame parsing began. Parse order only, not acquisition time. |
+| `timing_class` | `UNIQUE` (one frame in its read), `BATCH_LAST` (last frame of a batch; usable), `BATCH_EARLIER` (earlier frame of a batch; timing unknown), `UNKNOWN` (legacy caller without provenance). |
+
+Live `qdot`/`qddot` are derived values, not measurements. They are computed only between `UNIQUE`/`BATCH_LAST` rows with `dt > 0` of the same `connection_epoch`; `BATCH_EARLIER` rows get `nan`. Raw `q`, `current` and `timestamp` are never modified. Use `core.identification_audit.build_processed_dataset` for offline filtered velocity; the raw CSV stays the source of truth.
+
+Quality rules: with provenance, labelled batching gives a WARNING (the audit also FAILs if labels contradict the timestamps or usable rows repeat a timestamp). Legacy files without provenance (e.g. RUN_01/RUN_02 from 2026-10-15) still FAIL on duplicate timestamps because batching cannot be verified. Current is `nan` unless `CURRENTJOINTS` was present in that very STATUS message, so initialised defaults and stale values are never logged as measurements; a genuine measured `0` is logged as `0`.

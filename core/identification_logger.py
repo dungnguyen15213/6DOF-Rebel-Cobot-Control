@@ -27,6 +27,19 @@ METADATA_COLUMNS = [
     "thermal_condition",
 ]
 
+# Frame provenance, appended so earlier column positions are unchanged. "timestamp"
+# stays the host receive time of the TCP read; frames from one multi-frame read
+# share it, and timing_class marks which rows may be used for time derivatives.
+TIMING_COLUMNS = [
+    "connection_epoch",
+    "frame_counter",
+    "rx_chunk_id",
+    "frame_in_chunk",
+    "frames_in_chunk",
+    "t_frame_s",
+    "timing_class",
+]
+
 IDENTIFICATION_COLUMNS = [
     "timestamp",
     "sample_index",
@@ -35,7 +48,25 @@ IDENTIFICATION_COLUMNS = [
     *CURRENT_VECTOR_COLUMNS,
     *QDDOT_VECTOR_COLUMNS,
     *METADATA_COLUMNS,
+    *TIMING_COLUMNS,
 ]
+
+USABLE_TIMING_CLASSES = {"", "UNKNOWN", "UNIQUE", "BATCH_LAST"}
+
+
+def _timing_fields(frame_timing: Any) -> dict[str, Any]:
+    """Flatten optional FrameTiming provenance; legacy callers get UNKNOWN."""
+    if frame_timing is None:
+        return {"timing_class": "UNKNOWN"}
+    return {
+        "connection_epoch": frame_timing.connection_epoch,
+        "frame_counter": frame_timing.frame_counter,
+        "rx_chunk_id": frame_timing.chunk_id,
+        "frame_in_chunk": frame_timing.frame_in_chunk,
+        "frames_in_chunk": frame_timing.frames_in_chunk,
+        "t_frame_s": repr(float(frame_timing.t_frame_s)),
+        "timing_class": frame_timing.timing_class,
+    }
 
 
 def _sanitize_filename_component(value: str | None, fallback: str) -> str:
@@ -190,8 +221,10 @@ class IdentificationLogger:
         current: Iterable[Any],
         qddot: Iterable[Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        frame_timing: Any = None,
     ) -> None:
         del qdot, qddot, metadata  # Legacy arguments cannot alter frozen run data.
+        timing_fields = _timing_fields(frame_timing)
         sample_timestamp = _coerce_float(timestamp, float("nan"))
         sample_q = tuple(_as_float_list(q, 6))
         sample_current = tuple(_as_float_list(current, 6))
@@ -202,7 +235,7 @@ class IdentificationLogger:
             self._next_sample_index += 1
             try:
                 self._queue.put_nowait(
-                    (sample_index, sample_timestamp, sample_q, sample_current)
+                    (sample_index, sample_timestamp, sample_q, sample_current, timing_fields)
                 )
             except Full:
                 self.dropped_sample_count += 1
@@ -211,6 +244,7 @@ class IdentificationLogger:
         previous_timestamp: float | None = None
         previous_q: tuple[float, ...] | None = None
         previous_qdot: list[float] | None = None
+        previous_epoch: Any = None
         last_flush = time.monotonic()
         unflushed_rows = 0
 
@@ -225,13 +259,19 @@ class IdentificationLogger:
                 self._queue.task_done()
                 break
             if sample is not None:
-                sample_index, timestamp, q_values, current_values = sample
+                sample_index, timestamp, q_values, current_values, timing_fields = sample
+                usable = timing_fields["timing_class"] in USABLE_TIMING_CLASSES
+                epoch = timing_fields.get("connection_epoch")
+                if epoch != previous_epoch:
+                    previous_timestamp = previous_q = previous_qdot = None
+                    previous_epoch = epoch
                 dt = (
                     timestamp - previous_timestamp
                     if previous_timestamp is not None
                     else float("nan")
                 )
-                if previous_q is not None and math.isfinite(dt) and dt > 0.0:
+                # Earlier frames of a multi-frame read have no distinct measured time.
+                if usable and previous_q is not None and math.isfinite(dt) and dt > 0.0:
                     qdot_values = [
                         (q_values[index] - previous_q[index]) / dt
                         if math.isfinite(q_values[index]) and math.isfinite(previous_q[index])
@@ -241,7 +281,7 @@ class IdentificationLogger:
                 else:
                     qdot_values = [float("nan")] * 6
 
-                if previous_qdot is not None and math.isfinite(dt) and dt > 0.0:
+                if usable and previous_qdot is not None and math.isfinite(dt) and dt > 0.0:
                     qddot_values = [
                         (qdot_values[index] - previous_qdot[index]) / dt
                         if math.isfinite(qdot_values[index]) and math.isfinite(previous_qdot[index])
@@ -259,6 +299,7 @@ class IdentificationLogger:
                     **dict(zip(CURRENT_VECTOR_COLUMNS, current_values)),
                     **dict(zip(QDDOT_VECTOR_COLUMNS, qddot_values)),
                     **self._metadata,
+                    **timing_fields,
                 }
                 try:
                     self._writer.writerow(row)
@@ -271,9 +312,10 @@ class IdentificationLogger:
                     self.writer_error = str(exc)
                     self.dropped_sample_count += 1
 
-                previous_timestamp = timestamp
-                previous_q = q_values
-                previous_qdot = qdot_values if any(map(math.isfinite, qdot_values)) else None
+                if usable:
+                    previous_timestamp = timestamp
+                    previous_q = q_values
+                    previous_qdot = qdot_values if any(map(math.isfinite, qdot_values)) else None
                 self._queue.task_done()
 
             now = time.monotonic()
@@ -321,7 +363,8 @@ class IdentificationLogger:
                 "metadata": self.metadata,
                 "units": report["schema_summary"]["units"],
                 "signal_provenance": {
-                    "timestamp": "host monotonic time at CRI STATUS reception",
+                    "timestamp": "host perf_counter at the end of the TCP recv() that completed the STATUS frame; frames of one read share it (see timing_class); CRI STATUS carries no device timestamp",
+                    "timing_columns": "connection_epoch, frame_counter, rx_chunk_id, frame_in_chunk, frames_in_chunk, t_frame_s (parse-order time, not acquisition time), timing_class",
                     "q": "raw CRI STATUS POSJOINTCURRENT",
                     "current": "raw CRI STATUS CURRENTJOINTS",
                     "qdot": "derived from consecutive q samples using measured timestamp delta",
@@ -375,7 +418,11 @@ def _quality_status(report: dict[str, Any], dropped: int, writer_error: str | No
         or report["missing_values"].get("timestamp", 0)
         or report.get("invalid_numeric_values")
         or not report["monotonic"]
-        or report["duplicate_timestamps"]
+        or (
+            report.get("usable_timestamp_duplicates", 0)
+            if report.get("timing_provenance_present")
+            else report["duplicate_timestamps"]
+        )
         or report.get("metadata_inconsistent", False)
         or any(report.get("metadata_missing_rows", {}).values())
         or report.get("sample_index_gap_count", 0)
@@ -386,6 +433,7 @@ def _quality_status(report: dict[str, Any], dropped: int, writer_error: str | No
         return "FAIL"
     if (
         report.get("large_gap_count", 0)
+        or report.get("batched_row_count", 0)
         or report.get("suspicious_all_zero_current_rows", 0)
         or any(
             values["adjacent_repeat_count"]
@@ -433,6 +481,18 @@ def analyze_identification_csv(path: str | Path) -> dict[str, Any]:
     positive_dt = [value for value in dt_values if value > 0.0]
     timestamp_counts = Counter(valid_timestamps)
     duplicate_values = {value for value, count in timestamp_counts.items() if count > 1}
+    timing_classes = [str(row.get("timing_class") or "").strip() for row in rows]
+    class_counts = Counter(timing_classes)
+    provenance_present = any(value in {"UNIQUE", "BATCH_LAST", "BATCH_EARLIER"} for value in class_counts)
+    usable_timestamps = [
+        value
+        for value, klass in zip(timestamps, timing_classes)
+        if value is not None and klass in USABLE_TIMING_CLASSES
+    ]
+    usable_counts = Counter(usable_timestamps)
+    usable_duplicates = sum(count - 1 for count in usable_counts.values() if count > 1)
+    usable_dt = [b - a for a, b in zip(usable_timestamps, usable_timestamps[1:])]
+    batched_rows = class_counts.get("BATCH_LAST", 0) + class_counts.get("BATCH_EARLIER", 0)
     dt_sorted = sorted(dt_values)
 
     def percentile(values: list[float], percent: float) -> float | None:
@@ -542,6 +602,12 @@ def analyze_identification_csv(path: str | Path) -> dict[str, Any]:
         "duplicate_timestamp_values": len(duplicate_values),
         "duplicate_timestamps": sum(value in duplicate_values for value in valid_timestamps),
         "dt_nonpositive_count": sum(value <= 0.0 for value in dt_values),
+        "timing_provenance_present": provenance_present,
+        "timing_class_counts": dict(class_counts),
+        "batched_row_count": batched_rows,
+        "batched_row_fraction": batched_rows / len(rows) if rows else 0.0,
+        "usable_timestamp_duplicates": usable_duplicates,
+        "usable_nonincreasing_dt_count": sum(value <= 0.0 for value in usable_dt),
         "dt_negative_count": sum(value < 0.0 for value in dt_values),
         "invalid_dt_values": sum(value <= 0.0 for value in dt_values),
         "dt_min": min(dt_values) if dt_values else None,

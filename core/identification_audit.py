@@ -464,18 +464,44 @@ def audit_run(
             {"negative_dt": negative},
         )
     )
+    labels = [str(row.get("timing_class") or "").strip() for row in rows]
+    provenance = any(label in {"UNIQUE", "BATCH_LAST", "BATCH_EARLIER"} for label in labels)
+    if provenance:
+        batch = _batch_info(t)
+        expected = np.where(
+            batch["size"] == 1, "UNIQUE", np.where(batch["is_last"], "BATCH_LAST", "BATCH_EARLIER")
+        )
+        mismatched = int((np.array(labels) != expected).sum())
+        usable_t = t[[label != "BATCH_EARLIER" for label in labels]]
+        usable_nonincreasing = int((np.diff(usable_t) <= 0).sum())
+        t2_status = FAIL if (mismatched or usable_nonincreasing) else WARNING if zero else PASS
+        t2_evidence = {
+            "timing_provenance": "present",
+            "label_counts": {label: labels.count(label) for label in sorted(set(labels))},
+            "labels_inconsistent_with_timestamps": mismatched,
+            "usable_rows_with_nonincreasing_timestamp": usable_nonincreasing,
+            "dt_zero_count": zero,
+            "note": "batched rows are labelled; derivatives use only UNIQUE/BATCH_LAST rows. "
+            "True sample times inside a batch are unknown and not reconstructed.",
+        }
+    else:
+        t2_status = (
+            FAIL if duplicate_fraction > cfg.duplicate_timestamp_fail_fraction
+            else WARNING if zero else PASS
+        )
+        t2_evidence = {
+            "timing_provenance": "absent (legacy recording: batching cannot be verified)",
+            "dt_zero_count": zero,
+            "dt_zero_fraction": duplicate_fraction,
+            "fail_above_fraction": cfg.duplicate_timestamp_fail_fraction,
+            "cause": "several STATUS messages parsed from one socket read share its receive time; "
+            "samples are distinct but their true spacing is unknown",
+        }
     integrity.append(
         _criterion(
             "T2", "Timestamps are unique (one STATUS per host timestamp)",
-            FAIL if duplicate_fraction > cfg.duplicate_timestamp_fail_fraction
-            else WARNING if zero else PASS,
-            {
-                "dt_zero_count": zero,
-                "dt_zero_fraction": duplicate_fraction,
-                "fail_above_fraction": cfg.duplicate_timestamp_fail_fraction,
-                "cause": "several STATUS messages parsed from one socket read share its receive time; "
-                "samples are distinct but their true spacing is unknown",
-            },
+            t2_status,
+            t2_evidence,
         )
     )
     unique_t = np.unique(t[np.isfinite(t)])

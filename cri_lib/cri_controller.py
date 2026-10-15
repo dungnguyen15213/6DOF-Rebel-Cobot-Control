@@ -11,6 +11,7 @@ from typing import Any, Callable
 from core.latency_tracking import NetworkLatencyTracker
 from .cri_errors import CRICommandTimeOutError, CRIConnectionError
 from .cri_protocol_parser import CRIProtocolParser
+from .frame_timing import FrameTimer, FrameTiming, extract_frames
 from .robot_state import KinematicsState, RobotState
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,9 @@ class CRIController:
 
         self.can_mode: bool = False
         self.can_queue: Queue = Queue()
+
+        self.frame_timer = FrameTimer()
+        self.last_status_timing: FrameTiming | None = None
 
         self.jog_thread = threading.Thread(target=self._bg_alivejog_thread, daemon=True)
         self.receive_thread = threading.Thread(
@@ -264,6 +268,7 @@ class CRIController:
             return
 
         message_buffer = bytearray()
+        self.frame_timer.restart_connection()
 
         while self.connected:
             try:
@@ -277,27 +282,27 @@ class CRIController:
                 logger.error("Receive Thread: Connection lost.")
                 return
 
-            message_buffer.extend(recv_buffer)
+            self._process_received_chunk(message_buffer, recv_buffer, socket_received_at)
 
-            continue_parsing = True
-            while continue_parsing:
-                # check for an end of message
-                end_idx = message_buffer.find(b"CRIEND")
-                if end_idx != -1:
-                    start_idx = message_buffer.find(b"CRISTART")
+    def _process_received_chunk(
+        self, message_buffer: bytearray, data: bytes, t_chunk_rx: float
+    ) -> None:
+        """Split one TCP read into complete frames and parse them in order.
 
-                    # check if there is a complete message
-                    if start_idx != -1:
-                        message = message_buffer[start_idx : end_idx + 6].decode()
-                        self._parse_message(message, socket_received_at)
-
-                    # check if there is data left in the buffer
-                    if len(message_buffer) > end_idx + 7:
-                        message_buffer = message_buffer[end_idx + 7 :]
-                    else:
-                        message_buffer.clear()
-                else:
-                    continue_parsing = False
+        Every frame from this read keeps the read's receive time (``t_rx``) and
+        gets a ``FrameTiming`` describing its position in the read. Frames of a
+        multi-frame read were sampled earlier at unknown instants; no spacing is
+        invented for them.
+        """
+        message_buffer.extend(data)
+        frames, discarded = extract_frames(message_buffer)
+        self.frame_timer.discarded_frames += discarded
+        if not frames:
+            return
+        chunk_id = self.frame_timer.begin_chunk()
+        for index, message in enumerate(frames):
+            timing = self.frame_timer.stamp_frame(chunk_id, index, len(frames), t_chunk_rx)
+            self._parse_message(message, t_chunk_rx, timing)
 
     def _wait_for_answer(
         self,
@@ -353,7 +358,12 @@ class CRIController:
             else:
                 return None
 
-    def _parse_message(self, message: str, t_rx: float | None = None) -> None:
+    def _parse_message(
+        self,
+        message: str,
+        t_rx: float | None = None,
+        timing: FrameTiming | None = None,
+    ) -> None:
         """Internal function to parse a message. If an answer event is registered for a certain msg_id it is triggered."""
         received_at = perf_counter() if t_rx is None else t_rx
         if "STATUS" not in message:
@@ -361,6 +371,9 @@ class CRIController:
 
         if (notification := self.parser.parse_message(message)) is not None:
             answer_id = notification["answer"]
+            if answer_id == "status":
+                # Valid only inside the status callback, which runs in this thread.
+                self.last_status_timing = timing
             if answer_id == "status" and self.status_callback is not None:
                 try:
                     self.status_callback(self.robot_state, received_at)

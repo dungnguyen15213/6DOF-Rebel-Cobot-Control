@@ -1655,7 +1655,7 @@ class MainWindow(QMainWindow):
                 if "CURRENTJOINTS" in fields_seen and len(state.current_joints) >= 6
                 else [float("nan")] * 6
             )
-        if all(np.isfinite(value) for value in positions):
+            frame_timing = getattr(self.manager.robot, "last_status_timing", None)
             self.execution_latency.update_telemetry(positions, t_rx)
 
         with self._identification_lock:
@@ -1668,6 +1668,7 @@ class MainWindow(QMainWindow):
                 q=positions,
                 qdot=None,
                 current=currents,
+                frame_timing=frame_timing,
             )
 
     def move_to_start(self):
