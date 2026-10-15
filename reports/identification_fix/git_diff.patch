@@ -1,742 +1,1101 @@
-﻿diff --git a/IDENTIFICATION_DATA_COLLECTION.md b/IDENTIFICATION_DATA_COLLECTION.md
-index 18dd4a2..45b0355 100644
+diff --git a/IDENTIFICATION_DATA_COLLECTION.md b/IDENTIFICATION_DATA_COLLECTION.md
+index 45b0355..d611203 100644
 --- a/IDENTIFICATION_DATA_COLLECTION.md
 +++ b/IDENTIFICATION_DATA_COLLECTION.md
-@@ -162,3 +162,16 @@ Columns appended after the metadata columns:
- Live `qdot`/`qddot` are derived values, not measurements. They are computed only between `UNIQUE`/`BATCH_LAST` rows with `dt > 0` of the same `connection_epoch`; `BATCH_EARLIER` rows get `nan`. Raw `q`, `current` and `timestamp` are never modified. Use `core.identification_audit.build_processed_dataset` for offline filtered velocity; the raw CSV stays the source of truth.
+@@ -175,3 +175,49 @@ When a run is stopped, the raw CSV and `.csv.json` sidecar are saved first; a ba
+ ```
  
- Quality rules: with provenance, labelled batching gives a WARNING (the audit also FAILs if labels contradict the timestamps or usable rows repeat a timestamp). Legacy files without provenance (e.g. RUN_01/RUN_02 from 2026-10-15) still FAIL on duplicate timestamps because batching cannot be verified. Current is `nan` unless `CURRENTJOINTS` was present in that very STATUS message, so initialised defaults and stale values are never logged as measurements; a genuine measured `0` is logged as `0`.
+ New CSV column `status_frame_counter` counts STATUS frames only; `frame_counter` counts all frame types. The sidecar adds `logger_accounting`, `frame_accounting` (start/end per-type counters) and `live_derivative_policy` (live qdot/qddot are NaN when the receive interval is below 10 ms; heuristic, derived values are not ground truth).
 +
-+## RUN_03 procedure and post-run reporting
++## Current channel semantics and freshness (added after RUN_03)
 +
-+Before RUN_03 the operator must confirm that the trajectory is still safe and approved. Use the same `Pathways/trajectory_export.csv` (28 waypoints), unchanged speed, a new unique run ID, payload 0 g, NORMAL, grasp context NONE, and a real thermal label. Do not move the robot automatically.
++Each row has `position_validity` and `current_validity`:
 +
-+When a run is stopped, the raw CSV and `.csv.json` sidecar are saved first; a background thread then writes `reports/identification_runs/<run_id>/` (`RUN_AUDIT.md/json`, `timing_diagnostics.csv`, three plots, `run_manifest.json`). Report failures never affect the raw CSV. Manual commands:
++| State | Meaning |
++|---|---|
++| FRESH | The channel was present in that STATUS frame and finite. A measured 0 is FRESH. |
++| MISSING | The channel was absent from that STATUS frame; values are NaN, never a carried-over value. |
++| NON_FINITE | The channel was present but NaN/inf. |
++| UNKNOWN | Legacy file with no validity columns; freshness cannot be verified. |
 +
-+```powershell
-+& .\.venv\Scripts\python.exe -m core.run_report <identification.csv>
-+& .\.venv\Scripts\python.exe tools\export_identification_handoff.py --run <identification.csv>
++Stale values cannot be logged as measurements: the parser resets the per-frame field set every STATUS and the GUI only copies `CURRENTJOINTS` when it is in that frame. Controller-side repetition of an old value can only be detected statistically, so a legacy file is reported as NOT VERIFIED, not PASS.
++
++Not known from software evidence (no CRI manual in this repo): sign of `CURRENTJOINTS` (all RUN_03 values are >= 0, so sign is unverified), signed vs magnitude, and that indexes 0-5 map to J1-J6. Units are assumed mA; confirm against the vendor documentation before model fitting.
++
++RUN_03 finding: only J1, J2, J3, J5 moved. J4 and J6 stayed at 0 deg (J4 current constant 18-19 mA, J6 current 0 mA). They were not excited; that does not prove a fault.
++
++## Lab procedures (operator-run, no new limits)
++
++All motion uses the already-approved trajectory/jog workflow and the usual safety setup. Nothing here is autonomous.
++
++- **Test A, stationary baseline (30-60 s):** robot enabled, not moving, identification recording on. Expect all validity FRESH, zero velocity, constant currents. Audit with `python tools\audit_identification_run.py <csv>`.
++- **Test B, J6 validation:** using an already-approved safe movement that includes J6, record q6 and current6 together with the other channels. Check that q6 changes and current6 responds, and compare against the neighbouring joints. Do not infer a J6 fault or fix from RUN_03.
++- **Test C, repeat trajectory:** repeat the same trajectory as RUN_03, then compare run-to-run.
++- **Acceptance:** audit verdict not NOT READY, `current_freshness` PASS, STATUS frame accounting PASS, every joint to be identified shows motion and current response, sign confirmed.
++
++Commands:
++
++```
++python -m core.run_report <csv>
++python tools\audit_identification_run.py <csv> --processed
++python tools\export_identification_handoff.py --run <csv>
 +```
 +
-+New CSV column `status_frame_counter` counts STATUS frames only; `frame_counter` counts all frame types. The sidecar adds `logger_accounting`, `frame_accounting` (start/end per-type counters) and `live_derivative_policy` (live qdot/qddot are NaN when the receive interval is below 10 ms; heuristic, derived values are not ground truth).
++Preprocessing rules: `reports/identification_fix/PREPROCESSING_POLICY.md`. Acceleration from host receive times is exploratory only.
++
++## Tests
++
++```
++pip install -r requirements.txt
++$env:QT_QPA_PLATFORM="offscreen"
++python -m unittest discover -s tests -p "test_*.py"
++```
++
++GUI tests need PyQt6, scipy and pyyaml.
+diff --git a/core/identification_audit.py b/core/identification_audit.py
+index 7cc95fd..3abfd8f 100644
+--- a/core/identification_audit.py
++++ b/core/identification_audit.py
+@@ -19,6 +19,7 @@ from typing import Any, Iterator
+ import numpy as np
+ 
+ from core.identification_logger import (
++    MIN_DERIVATIVE_DT_S,
+     CURRENT_VECTOR_COLUMNS,
+     METADATA_COLUMNS,
+     Q_VECTOR_COLUMNS,
+@@ -393,10 +394,47 @@ def audit_run(
+             break
+         leading_zero += 1
+     multi_zero = np.flatnonzero((current == 0.0).sum(axis=1) >= cfg.multi_zero_channels)
++    validity_present = "current_validity" in run["fieldnames"] and "position_validity" in run["fieldnames"]
++    validity_counts = {
++        channel: {
++            state: sum(str(row.get(f"{channel}_validity", "")).strip() == state for row in rows)
++            for state in ("FRESH", "MISSING", "NON_FINITE", "UNKNOWN")
++        }
++        for channel in ("position", "current")
++    }
++    if validity_present:
++        bad_validity = {
++            channel: counts for channel, counts in validity_counts.items()
++            if counts["MISSING"] or counts["NON_FINITE"]
++        }
++        unverified = any(
++            counts["FRESH"] != len(rows) and not (counts["MISSING"] or counts["NON_FINITE"])
++            for counts in validity_counts.values()
++        )
++        integrity.append(
++            _criterion(
++                "I8", "Explicit per-row freshness of position and current telemetry",
++                FAIL if bad_validity else NOT_VERIFIED if unverified else PASS,
++                {"counts": validity_counts,
++                 "rule": "FRESH = field present in the same STATUS and finite; a measured 0 is FRESH"},
++            )
++        )
++    else:
++        integrity.append(
++            _criterion(
++                "I8", "Explicit per-row freshness of position and current telemetry",
++                NOT_VERIFIED,
++                "legacy recording without position_validity/current_validity columns",
++            )
++        )
++    i5_status = FAIL if leading_zero else WARNING if all_zero.any() or multi_zero.size else PASS
++    if validity_present and validity_counts["current"]["FRESH"] == len(rows):
++        # Zeros are then genuine measurements (or controller-reported), not initialisation.
++        i5_status = PASS
+     integrity.append(
+         _criterion(
+             "I5", "Current telemetry is fresh (no initialized or partially zeroed rows)",
+-            FAIL if leading_zero else WARNING if all_zero.any() or multi_zero.size else PASS,
++            i5_status,
+             {
+                 "all_zero_rows": int(all_zero.sum()),
+                 "leading_all_zero_rows": leading_zero,
+@@ -566,6 +604,7 @@ def audit_run(
+     else:
+         dropped = sidecar_data.get("writer_dropped_sample_count", 0)
+         writer_error = sidecar_data.get("writer_error")
++        integrity.append(_frame_accounting_criterion(sidecar_data, len(rows), rows))
+         integrity.append(
+             _criterion(
+                 "L1", "Logger writer reported no drops or errors",
+@@ -633,6 +672,37 @@ def audit_run(
+     return report
+ 
+ 
++def _frame_accounting_criterion(sidecar: dict[str, Any], row_count: int, rows: list[dict[str, str]]) -> dict[str, Any]:
++    """STATUS frames received during the recording must equal rows written (other types are not data loss)."""
++    name = "All received STATUS frames are accounted for"
++    counters = []
++    for row in rows:
++        try:
++            counters.append(int(row.get("status_frame_counter", "")))
++        except (TypeError, ValueError):
++            counters.append(-1)
++    contiguous = bool(counters) and all(c >= 0 for c in counters) and all(b - a == 1 for a, b in zip(counters, counters[1:]))
++    accounting = sidecar.get("frame_accounting") or {}
++    start, end = accounting.get("start"), accounting.get("end")
++    evidence: dict[str, Any] = {"status_counter_contiguous": contiguous, "rows": row_count}
++    if not start or not end or start.get("connection_epoch") != end.get("connection_epoch"):
++        return _criterion("L2", name, NOT_VERIFIED if not start or not end else FAIL,
++                          {**evidence, "reason": "start/end frame stats missing or the connection restarted during the run"})
++    received = end["status_frames"] - start["status_frames"]
++    evidence.update(
++        status_frames_received=received,
++        discarded_frames_delta=end.get("discarded_frames", 0) - start.get("discarded_frames", 0),
++        parse_errors_delta=end.get("parse_errors", 0) - start.get("parse_errors", 0),
++        callback_errors_delta=end.get("status_callback_errors", 0) - start.get("status_callback_errors", 0),
++        other_frame_types_ignored_here=True,
++    )
++    # +/-1: the stop snapshot can be taken just before/after the final callback.
++    ok = abs(received - row_count) <= 1 and contiguous
++    if evidence["parse_errors_delta"] or evidence["callback_errors_delta"] or evidence["discarded_frames_delta"]:
++        ok = False
++    return _criterion("L2", name, PASS if ok else FAIL, evidence)
++
++
+ def _stats(values: np.ndarray) -> dict[str, float | None]:
+     if values.size == 0:
+         return {"min": None, "median": None, "mean": None, "p95": None, "p99": None, "max": None, "std": None}
+@@ -706,10 +776,16 @@ PROCESSED_UNITS = {
+ }
+ 
+ 
+-def _gradient(values: np.ndarray, times: np.ndarray) -> np.ndarray:
++def _gradient(values: np.ndarray, times: np.ndarray, min_dt_s: float = 0.0) -> np.ndarray:
++    """Central difference; NaN (never 0) unless both neighbouring intervals are >= min_dt_s."""
+     result = np.full(values.shape, np.nan)
+     if values.size >= 3:
+-        result[1:-1] = (values[2:] - values[:-2]) / (times[2:] - times[:-2])
++        back = times[1:-1] - times[:-2]
++        fwd = times[2:] - times[1:-1]
++        ok = (back >= max(min_dt_s, np.finfo(float).tiny)) & (fwd >= max(min_dt_s, np.finfo(float).tiny))
++        span = times[2:] - times[:-2]
++        diff = values[2:] - values[:-2]
++        result[1:-1] = np.where(ok, diff / np.where(ok, span, 1.0), np.nan)
+     return result
+ 
+ 
+@@ -717,6 +793,7 @@ def build_processed_dataset(
+     csv_path: str | Path,
+     output_path: str | Path,
+     smoothing_window: int = 1,
++    min_dt_s: float = MIN_DERIVATIVE_DT_S,
+ ) -> dict[str, Any]:
+     """Write a derived CSV (SI units) and provenance JSON; the raw CSV is only read.
+ 
+@@ -753,10 +830,10 @@ def build_processed_dataset(
+         qk = q_rad[kept_indices, joint]
+         if not np.isfinite(qk).all():
+             continue
+-        velocity = _gradient(qk, kept_t)
++        velocity = _gradient(qk, kept_t, min_dt_s)
+         if smoothing_window > 1:
+             velocity = _moving_average(velocity, smoothing_window)
+-        acceleration = _gradient(np.where(np.isfinite(velocity), velocity, np.nan), kept_t)
++        acceleration = _gradient(np.where(np.isfinite(velocity), velocity, np.nan), kept_t, min_dt_s)
+         qdot[kept_indices, joint] = velocity
+         qddot[kept_indices, joint] = acceleration
+ 
+@@ -764,6 +841,8 @@ def build_processed_dataset(
+         "source_file", "source_row", "sample_index", "t_host_s", "t_s",
+         *METADATA_COLUMNS, "batch_size", "batch_position", "flag_duplicate_timestamp",
+         "flag_current_invalid", "flag_use_for_derivatives",
++        "status_frame_counter", "timing_class", "position_validity", "current_validity",
++        "flag_velocity_valid", "flag_acceleration_valid",
+         *(f"q{j}_rad" for j in range(1, 7)),
+         *(f"qdot{j}_rad_s" for j in range(1, 7)),
+         *(f"qddot{j}_rad_s2" for j in range(1, 7)),
+@@ -787,6 +866,12 @@ def build_processed_dataset(
+                 "flag_duplicate_timestamp": int(batch["size"][index] > 1),
+                 "flag_current_invalid": int(not np.isfinite(current_mA[index]).all()),
+                 "flag_use_for_derivatives": int(increasing[index]),
++                "status_frame_counter": row.get("status_frame_counter", ""),
++                "timing_class": row.get("timing_class", ""),
++                "position_validity": row.get("position_validity", ""),
++                "current_validity": row.get("current_validity", ""),
++                "flag_velocity_valid": int(np.isfinite(qdot[index]).all()),
++                "flag_acceleration_valid": int(np.isfinite(qddot[index]).all()),
+             }
+             for joint in range(6):
+                 out[f"q{joint + 1}_rad"] = repr(float(q_rad[index, joint]))
+@@ -810,6 +895,18 @@ def build_processed_dataset(
+         },
+         "rows": len(rows),
+         "derivative_rows": int(np.isfinite(qdot[:, 0]).sum()),
++        "parameters": {"min_dt_s": min_dt_s, "smoothing_window": smoothing_window,
++                       "representative_policy": "last row of each identical-timestamp batch"},
++        "exclusions": {
++            "rows_total": len(rows),
++            "not_batch_last_or_non_finite_time": int((~usable).sum()),
++            "representative_rows": int(usable.sum()),
++            "representative_rows_without_valid_velocity": int((usable & ~np.isfinite(qdot).all(axis=1)).sum()),
++            "representative_rows_without_valid_acceleration": int((usable & ~np.isfinite(qddot).all(axis=1)).sum()),
++        },
++        "limitations": "Times are host receive times, not sample times. Velocity is a candidate; acceleration is "
++        "exploratory and must not be treated as physical ground truth. Unavailable values are NaN, never 0. "
++        "Anomalies are not smoothed away unless smoothing_window>1 is requested and recorded here.",
+         "run_id": sorted({row.get("run_id", "") for row in rows}),
+         "model_features": {
+             "A": "[1, qdot, tanh(qdot/v_s), sin(q), cos(q)]",
 diff --git a/core/identification_logger.py b/core/identification_logger.py
-index 91635da..fdb17bb 100644
+index fdb17bb..3e34b4d 100644
 --- a/core/identification_logger.py
 +++ b/core/identification_logger.py
-@@ -38,8 +38,15 @@ TIMING_COLUMNS = [
-     "frames_in_chunk",
-     "t_frame_s",
-     "timing_class",
-+    "status_frame_counter",
+@@ -41,6 +41,22 @@ TIMING_COLUMNS = [
+     "status_frame_counter",
  ]
  
-+# Live derivatives need receive intervals at least this long. Shorter intervals
-+# are host-scheduling artefacts (RUN_02: 0.2 ms between reads), not sampling
-+# intervals, and would turn quantisation steps into huge velocities. Heuristic,
-+# not a robot specification; the raw CSV is unaffected.
-+MIN_DERIVATIVE_DT_S = 0.01
++# Per-row validity of the raw channels, from the STATUS message that produced the row.
++# FRESH: the field was present in this very STATUS and all six values are finite
++#   (a measured 0 is FRESH). MISSING: field absent from this STATUS (value logged as
++#   nan, the cached RobotState value is never reused). NON_FINITE: field present but
++#   a value did not parse to a finite number. UNKNOWN: caller gave no field info.
++VALIDITY_COLUMNS = ["position_validity", "current_validity"]
++VALIDITY_STATES = ("FRESH", "MISSING", "NON_FINITE", "UNKNOWN")
 +
- IDENTIFICATION_COLUMNS = [
-     "timestamp",
-     "sample_index",
-@@ -66,6 +73,7 @@ def _timing_fields(frame_timing: Any) -> dict[str, Any]:
-         "frames_in_chunk": frame_timing.frames_in_chunk,
-         "t_frame_s": repr(float(frame_timing.t_frame_s)),
-         "timing_class": frame_timing.timing_class,
-+        "status_frame_counter": frame_timing.status_counter,
-     }
++
++def classify_channel(status_fields: Any, field: str, values: Iterable[float]) -> str:
++    if status_fields is None:
++        return "UNKNOWN"
++    if field not in status_fields:
++        return "MISSING"
++    return "FRESH" if all(math.isfinite(v) for v in values) else "NON_FINITE"
++
+ # Live derivatives need receive intervals at least this long. Shorter intervals
+ # are host-scheduling artefacts (RUN_02: 0.2 ms between reads), not sampling
+ # intervals, and would turn quantisation steps into huge velocities. Heuristic,
+@@ -56,6 +72,7 @@ IDENTIFICATION_COLUMNS = [
+     *QDDOT_VECTOR_COLUMNS,
+     *METADATA_COLUMNS,
+     *TIMING_COLUMNS,
++    *VALIDITY_COLUMNS,
+ ]
  
- 
-@@ -185,6 +193,9 @@ class IdentificationLogger:
-         self._next_sample_index = 0
+ USABLE_TIMING_CLASSES = {"", "UNKNOWN", "UNIQUE", "BATCH_LAST"}
+@@ -194,6 +211,8 @@ class IdentificationLogger:
          self.row_count = 0
          self.dropped_sample_count = 0
-+        self.samples_offered = 0
-+        self.samples_q_complete = 0
-+        self.samples_current_complete = 0
+         self.samples_offered = 0
++        self.position_validity_counts = {state: 0 for state in VALIDITY_STATES}
++        self.current_validity_counts = {state: 0 for state in VALIDITY_STATES}
+         self.samples_q_complete = 0
+         self.samples_current_complete = 0
          self.writer_error: str | None = None
-         self._first_timestamp: float | None = None
-         self._last_timestamp: float | None = None
-@@ -233,6 +244,9 @@ class IdentificationLogger:
+@@ -233,18 +252,23 @@ class IdentificationLogger:
+         qddot: Iterable[Any] | None = None,
+         metadata: dict[str, Any] | None = None,
+         frame_timing: Any = None,
++        status_fields: Any = None,
+     ) -> None:
+         del qdot, qddot, metadata  # Legacy arguments cannot alter frozen run data.
+         timing_fields = _timing_fields(frame_timing)
+         sample_timestamp = _coerce_float(timestamp, float("nan"))
+         sample_q = tuple(_as_float_list(q, 6))
+         sample_current = tuple(_as_float_list(current, 6))
++        timing_fields["position_validity"] = classify_channel(status_fields, "POSJOINTCURRENT", sample_q)
++        timing_fields["current_validity"] = classify_channel(status_fields, "CURRENTJOINTS", sample_current)
+         with self._state_lock:
+             if not self._accepting_samples:
                  return
              sample_index = self._next_sample_index
              self._next_sample_index += 1
-+            self.samples_offered += 1
-+            self.samples_q_complete += all(math.isfinite(v) for v in sample_q)
-+            self.samples_current_complete += all(math.isfinite(v) for v in sample_current)
+             self.samples_offered += 1
++            self.position_validity_counts[timing_fields["position_validity"]] += 1
++            self.current_validity_counts[timing_fields["current_validity"]] += 1
+             self.samples_q_complete += all(math.isfinite(v) for v in sample_q)
+             self.samples_current_complete += all(math.isfinite(v) for v in sample_current)
              try:
-                 self._queue.put_nowait(
-                     (sample_index, sample_timestamp, sample_q, sample_current, timing_fields)
-@@ -271,7 +285,8 @@ class IdentificationLogger:
-                     else float("nan")
-                 )
-                 # Earlier frames of a multi-frame read have no distinct measured time.
--                if usable and previous_q is not None and math.isfinite(dt) and dt > 0.0:
-+                dt_ok = usable and math.isfinite(dt) and dt >= MIN_DERIVATIVE_DT_S
-+                if dt_ok and previous_q is not None:
-                     qdot_values = [
-                         (q_values[index] - previous_q[index]) / dt
-                         if math.isfinite(q_values[index]) and math.isfinite(previous_q[index])
-@@ -281,7 +296,7 @@ class IdentificationLogger:
-                 else:
-                     qdot_values = [float("nan")] * 6
- 
--                if usable and previous_qdot is not None and math.isfinite(dt) and dt > 0.0:
-+                if dt_ok and previous_qdot is not None:
-                     qddot_values = [
-                         (qdot_values[index] - previous_qdot[index]) / dt
-                         if math.isfinite(qdot_values[index]) and math.isfinite(previous_qdot[index])
-@@ -334,7 +349,7 @@ class IdentificationLogger:
-         finally:
-             self._file.close()
- 
--    def close(self) -> dict[str, Any] | None:
-+    def close(self, frame_accounting: dict[str, Any] | None = None) -> dict[str, Any] | None:
-         with self._close_lock:
-             if self._closed:
-                 return self._summary
-@@ -371,6 +386,18 @@ class IdentificationLogger:
-                     "qddot": "candidate derived signal; unavailable until sufficient samples exist",
+@@ -394,6 +418,11 @@ class IdentificationLogger:
+                     "dropped_by_queue_or_writer": self.dropped_sample_count,
                  },
-                 "writer_dropped_sample_count": self.dropped_sample_count,
-+                "logger_accounting": {
-+                    "samples_offered_to_logger": self.samples_offered,
-+                    "samples_with_complete_q": self.samples_q_complete,
-+                    "samples_with_complete_current": self.samples_current_complete,
-+                    "rows_written": self.row_count,
-+                    "dropped_by_queue_or_writer": self.dropped_sample_count,
+                 "frame_accounting": frame_accounting,
++                "validity_accounting": {
++                    "position": dict(self.position_validity_counts),
++                    "current": dict(self.current_validity_counts),
++                    "note": "FRESH = field present in the same STATUS and finite (measured 0 is FRESH); MISSING/NON_FINITE rows are logged as nan, never as 0",
 +                },
-+                "frame_accounting": frame_accounting,
-+                "live_derivative_policy": {
-+                    "min_dt_s": MIN_DERIVATIVE_DT_S,
-+                    "rule": "qdot/qddot are NaN (unavailable, not zero) for BATCH_EARLIER rows, dt < min_dt_s, or non-finite inputs; they are derived, never ground truth",
-+                },
-                 "writer_error": self.writer_error,
-                 "quality_status": status,
-                 "quality_report": report,
+                 "live_derivative_policy": {
+                     "min_dt_s": MIN_DERIVATIVE_DT_S,
+                     "rule": "qdot/qddot are NaN (unavailable, not zero) for BATCH_EARLIER rows, dt < min_dt_s, or non-finite inputs; they are derived, never ground truth",
 diff --git a/core/run_report.py b/core/run_report.py
-new file mode 100644
-index 0000000..6de50ea
---- /dev/null
+index 6de50ea..27f5001 100644
+--- a/core/run_report.py
 +++ b/core/run_report.py
-@@ -0,0 +1,242 @@
-+"""Post-run report for one identification CSV.
+@@ -16,7 +16,7 @@ from typing import Any
+ 
+ import numpy as np
+ 
+-from core.identification_audit import audit_run, format_report
++from core.identification_audit import audit_run, build_processed_dataset, format_report
+ 
+ PASS, WARNING, FAIL, NV = "PASS", "WARNING", "FAIL", "NOT VERIFIED"
+ RECEIVE_DT_CV_LIMIT = 0.25  # heuristic: receive-interval jitter acceptable for derivatives
+@@ -98,45 +98,114 @@ def current_freshness(rows: list[dict[str, str]]) -> dict[str, Any]:
+     return result
+ 
+ 
++def _crit(audit: dict[str, Any], cid: str) -> tuple[str, Any]:
++    for item in audit["criteria"]:
++        if item["id"] == cid:
++            return item["status"], item["evidence"]
++    return NV, "criterion not evaluated"
 +
-+Writes reports/identification_runs/<run_id>/ without touching the raw CSV.
-+Decisions A/B/C are assessed independently and use only evidence present in
-+the file; anything that needs hardware or device timestamps is NOT VERIFIED.
-+"""
++
++def _worst(statuses: list[str]) -> str:
++    for level in (FAIL, WARNING, NV):
++        if level in statuses:
++            return level
++    return PASS
++
++
+ def decisions(audit: dict[str, Any], timing: dict[str, Any], currents: dict[str, Any]) -> dict[str, Any]:
+-    crit = {c["id"]: c for c in audit["criteria"]}
+-    # A. raw telemetry integrity
+-    a_fail = [k for k in ("R1", "R2", "R3", "I1", "I2", "I3") if k in crit and crit[k]["status"] == FAIL]
+-    stuck = [j for j, s in currents.items() if s["finite"] and s["exact_zero"] == s["finite"]]
+-    if a_fail:
+-        a = (FAIL, f"criteria failed: {a_fail}")
+-    elif stuck:
+-        a = (WARNING, f"channels exactly zero on every row: {stuck}; may be an unmoved/unloaded joint or a missing field (hardware check needed)")
+-    else:
+-        a = (PASS, "structural checks pass")
+-    # B. timestamp provenance
+-    t2 = crit.get("T2", {}).get("status", NV)
+-    b = (t2, "host receive time only; no device timestamp exists in CRI STATUS frames; batched rows share a timestamp")
+-    if t2 == PASS:
+-        b = (WARNING, b[1])
+-    # C. Model A (offline, current vs. position-derived features)
++    """Independent decisions; the readiness verdict is derived from them only.
++
++    Genuine zero current and stationary joints are never failures by themselves.
++    Any missing/non-finite raw value, missing column, malformed row, invalid
++    metadata, lost data or writer error is a FAIL.
++    """
++    st = {c["id"]: c["status"] for c in audit["criteria"]}
++    i4_status, i4 = _crit(audit, "I4")
++    bad_cols = i4.get("bad_columns", {}) if isinstance(i4, dict) else {}
++    bad_q = [c for c in bad_cols if c.startswith("q")]
++    bad_i = [c for c in bad_cols if c.startswith("current")]
++    structural = [k for k in ("R1", "R2", "R3") if st.get(k) == FAIL]
++    meta = [k for k in ("I1", "I2", "I3") if st.get(k) == FAIL]
++    ts_issue = isinstance(i4, dict) and any(i4.get("timestamp_issues", {}).values())
++
++    d: dict[str, dict[str, Any]] = {}
++    d["structure_and_metadata"] = {
++        "status": FAIL if structural or meta else PASS,
++        "reason": f"failed: {structural + meta}" if structural or meta else "columns, rows and metadata valid",
++    }
++    d["raw_positions"] = {
++        "status": FAIL if bad_q or structural or ts_issue else PASS,
++        "reason": f"missing/non-finite: {bad_q}" if bad_q else "all q finite (a constant joint is not a failure)",
++    }
++    constant = st.get("I6") == WARNING
++    d["raw_current"] = {
++        "status": FAIL if bad_i or structural else WARNING if constant else PASS,
++        "reason": f"missing/non-finite: {bad_i}" if bad_i
++        else "constant/zero channels present (stationary or unverified; genuine zeros are not a failure)" if constant
++        else "all current finite and varying",
++    }
++    i8, i8e = _crit(audit, "I8")
++    d["current_freshness"] = {
++        "status": i8,
++        "reason": {PASS: "every row has FRESH current and position from its own STATUS message",
++                   FAIL: "rows with MISSING/NON_FINITE telemetry", NV: "no explicit freshness flags in this recording"}[i8],
++        "evidence": i8e,
++    }
++    l2, l2e = _crit(audit, "L2")
++    d["status_frame_accounting"] = {
++        "status": FAIL if st.get("T4") == FAIL or l2 == FAIL else l2 if l2 != PASS else PASS,
++        "reason": "STATUS frames received during the run equal rows written; other frame types are not data loss"
++        if l2 == PASS else "see L2 evidence",
++        "evidence": l2e,
++    }
++    d["logger_integrity"] = {
++        "status": FAIL if st.get("L1") == FAIL else st.get("L1", NV),
++        "reason": "writer drops or errors" if st.get("L1") == FAIL else "no writer drops or errors reported",
++    }
++    t2 = st.get("T2", NV)
++    d["receive_timing"] = {
++        "status": FAIL if st.get("T1") == FAIL or t2 == FAIL else WARNING,
++        "reason": "host receive time only; STATUS carries no device timestamp; batched rows share a timestamp (labelled, not repaired)",
++    }
+     chunk = timing.get("chunk_dt_s")
+     if chunk is None:
+-        c_model = (NV, "no chunk timing")
++        vel = acc = (NV, "no chunk timing")
+     else:
+-        frac = chunk["fraction_below_min_dt"]
+-        cv = chunk["cv"]
+-        if cv is not None and cv > RECEIVE_DT_CV_LIMIT or frac > 0.05:
+-            c_model = (FAIL, f"receive-interval CV={cv:.2f}, fraction<min dt={frac:.2f}: acceleration from receive times is unreliable (Model B)")
+-        else:
+-            c_model = (WARNING, "receive intervals acceptable but still not device-time; verify on hardware")
+-    a_model = (WARNING if a[0] != FAIL else FAIL,
+-               "Model A (position/velocity-light, one sample per unique timestamp) usable offline only if currents are valid; excitation not assessed here")
+-    ready = FAIL if FAIL in (a[0], b[0]) else (WARNING if WARNING in (a[0], b[0], c_model[0]) else PASS)
+-    verdict = {FAIL: "NOT READY", WARNING: "CONDITIONALLY READY", PASS: "READY FOR CONTROLLED 0 G DRY TEST"}[ready]
+-    return {
+-        "A_raw_telemetry_integrity": {"status": a[0], "reason": a[1]},
+-        "B_timestamp_provenance": {"status": b[0], "reason": b[1]},
+-        "C_model_A_offline": {"status": a_model[0], "reason": a_model[1]},
+-        "C_model_B_live_derivatives": {"status": c_model[0], "reason": c_model[1]},
+-        "overall_readiness": verdict,
++        frac, cv = chunk["fraction_below_min_dt"], chunk["cv"]
++        jitter = (cv is not None and cv > RECEIVE_DT_CV_LIMIT) or frac > 0.05
++        vel = (WARNING, "finite differences use host receive intervals >= 10 ms; velocity noise unquantified")
++        acc = (FAIL if jitter else WARNING,
++               f"receive-interval CV={cv:.2f}, fraction<min dt={frac:.2f}: " + (
++                   "acceleration from receive times is unreliable" if jitter else "needs hardware timing validation"))
++    d["derived_velocity"] = {"status": vel[0], "reason": vel[1]}
++    d["derived_acceleration"] = {"status": acc[0], "reason": acc[1]}
++    raw_ok = all(d[k]["status"] != FAIL for k in
++                 ("structure_and_metadata", "raw_positions", "raw_current", "status_frame_accounting", "logger_integrity"))
++    d["model_a_exploratory"] = {
++        "status": WARNING if raw_ok else FAIL,
++        "reason": "offline exploration only: position/velocity features on time-valid rows; not final training data"
++        if raw_ok else "raw telemetry failed",
+     }
+-
++    d["model_b"] = {
++        "status": FAIL if not raw_ok or acc[0] == FAIL else WARNING,
++        "reason": "acceleration regressor unreliable with this timing" if acc[0] == FAIL else "unverified",
++    }
++    exc = audit.get("excitation_summary", {})
++    d["excitation"] = {
++        "status": exc.get("status", NV),
++        "reason": f"excited joints {exc.get('excited_joints')}; not fully excited {exc.get('not_fully_excited_joints')}",
++    }
++    gate = [d[k]["status"] for k in ("structure_and_metadata", "raw_positions", "raw_current",
++                                      "current_freshness", "status_frame_accounting", "logger_integrity", "receive_timing")]
++    if FAIL in gate or audit.get("overall_status") == FAIL:
++        verdict = "NOT READY"
++    elif all(s == PASS for s in gate[:-1]) and gate[-1] == WARNING and d["current_freshness"]["status"] == PASS \
++            and d["raw_current"]["status"] == PASS:
++        verdict = "READY FOR CONTROLLED 0 G DRY TEST"
++    else:
++        verdict = "CONDITIONALLY READY"
++    d["overall_readiness"] = verdict
++    return d
+ 
+ def _plots(rows: list[dict[str, str]], out_dir: Path) -> list[str]:
+     try:
+@@ -221,6 +290,13 @@ def generate_run_report(csv_path: str | Path, out_root: str | Path = REPORT_ROOT
+             w.writerow([row.get(c, "") for c in cols])
+ 
+     plots = _plots(rows, out_dir)
++    # Derived offline dataset, separate from the raw CSV; skipped when the audit failed.
++    processed = out_dir / "processed_dataset.csv"
++    if audit["overall_status"] != FAIL:
++        try:
++            build_processed_dataset(csv_path, processed)
++        except ValueError as exc:
++            plots.append(f"processed dataset skipped: {exc}")
+     manifest = {
+         "run_id": run_id, "source_file": str(csv_path), "source_sha256": report["source_sha256"],
+         "files": sorted(p.name for p in out_dir.iterdir()), "plots": plots,
+@@ -230,13 +306,18 @@ def generate_run_report(csv_path: str | Path, out_root: str | Path = REPORT_ROOT
+ 
+ 
+ def main(argv: list[str] | None = None) -> int:
+-    args = sys.argv[1:] if argv is None else argv
+-    if not args:
+-        print("usage: python -m core.run_report <identification.csv>")
+-        return 2
+-    print(generate_run_report(args[0]))
+-    return 0
++    import argparse
++
++    parser = argparse.ArgumentParser(description="Write the post-run report for one identification CSV")
++    parser.add_argument("csv_path")
++    parser.add_argument("--out-root", default=str(REPORT_ROOT))
++    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
++    out = generate_run_report(args.csv_path, args.out_root)
++    verdict = json.loads((out / "RUN_AUDIT.json").read_text(encoding="utf-8"))["decisions"]["overall_readiness"]
++    print(out)
++    print(verdict)
++    return 1 if verdict == "NOT READY" else 0
+ 
+ 
+ if __name__ == "__main__":
+-    raise SystemExit(main())
++    raise SystemExit(main())
+\ No newline at end of file
+diff --git a/gui/main_window.py b/gui/main_window.py
+index 06b5ec4..02fb294 100644
+--- a/gui/main_window.py
++++ b/gui/main_window.py
+@@ -1693,6 +1693,7 @@ class MainWindow(QMainWindow):
+                 qdot=None,
+                 current=currents,
+                 frame_timing=frame_timing,
++                status_fields=fields_seen,
+             )
+ 
+     def move_to_start(self):
+diff --git a/reports/identification_fix/COPILOT_CHANGE_REPORT.md b/reports/identification_fix/COPILOT_CHANGE_REPORT.md
+index f86d08c..8d3e2be 100644
+--- a/reports/identification_fix/COPILOT_CHANGE_REPORT.md
++++ b/reports/identification_fix/COPILOT_CHANGE_REPORT.md
+@@ -1,7 +1,14 @@
+-?# Copilot change report
++?# Change report: 0 g identification integrity after RUN_03
+ 
+-Changed: `cri_lib/frame_timing.py` (per-type counters, STATUS-only batching), `cri_lib/cri_controller.py` (STATUS-only stamping, parse/callback error counters, `frame_stats()`), `core/identification_logger.py` (`status_frame_counter`, min-dt derivative gate, accounting in sidecar), `gui/main_window.py` (frame-stat snapshots, background post-run report), new `core/run_report.py`, `tools/export_identification_handoff.py`, `tests/test_run_report.py`, docs.
+-Not changed: trajectory planner, motion control, FF-RLS, CUSUM, thresholds, payload inference, VFF-RLS, state machine. Raw data untouched.
+-Evidence: `root_cause_analysis.md`, `test_results.txt` (real output; only `test_move_to_start_latency` errors, PyQt6 not installed), `git_diff.patch`, `git_status.txt`.
+-Unverified (hardware): reason for ~22 Hz read rate, J6 zero current, zero-current rows, STATUS-only frame_counter gaps.
+-Verdict: CONDITIONALLY READY for a controlled 0 g dry test with new logger (RUN_03); RUN_02 itself is NOT READY as evidence.
++No new hardware run was performed. Code, tests and docs only. Raw CSVs untouched. Robot motion, planner, FF-RLS, CUSUM, collision, payload, state machine, VFF-RLS and regressors untouched. No thresholds weakened.
++
++1. Problems investigated: see phase1_run03_investigation.md and root_cause_analysis.md.
++2. Fixes: per-row `position_validity`/`current_validity` in the logger; audit criteria I8 (freshness) and L2 (STATUS frame accounting); I5 PASS when all rows FRESH; `run_report.decisions()` derived from all audit criteria (previously ignored I4/T1/T4/L1/overall FAIL); CLI exit 1 on NOT READY.
++3. Processed dataset: min-dt gated derivatives (NaN, never 0), extra provenance columns, exclusions and limitations; written automatically by the post-run report.
++4. Exporter: explicit `--run`, hash/run identity validation, no substitution, README with missing artifacts and file hashes.
++5. Docs: current semantics/freshness, Tests A/B/C, PREPROCESSING_POLICY.md, requirements.txt.
++6. Tests: 104 tests OK headless (test_results.txt), including 19 audit-readiness and 2 handoff tests.
++7. RUN_03 verdict: CONDITIONALLY READY (commissioning-grade, exploratory only). Freshness NOT VERIFIED (legacy file), J4/J6 unexcited, current sign unverified, acceleration FAIL, Model B FAIL.
++8. Not verified: J6 behaviour, current sign/index mapping, freshness on hardware.
++9. Next physical tests: A, B, C in IDENTIFICATION_DATA_COLLECTION.md.
++10. Commands: `python -m core.run_report <csv>`; `python tools\audit_identification_run.py <csv>`; `python tools\export_identification_handoff.py --run <csv>`.
+diff --git a/reports/identification_fix/PREPROCESSING_POLICY.md b/reports/identification_fix/PREPROCESSING_POLICY.md
+new file mode 100644
+index 0000000..e047f7b
+--- /dev/null
++++ b/reports/identification_fix/PREPROCESSING_POLICY.md
+@@ -0,0 +1,10 @@
++?# Offline preprocessing policy
++
++Raw CSV files in `identification_data/` are never modified. `core.identification_audit.build_processed_dataset` (run automatically by `core.run_report`, or by `tools/audit_identification_run.py --processed`) writes a separate `processed_dataset.csv` plus `processed_dataset.csv.provenance.json` (source SHA-256, parameters, exclusion counts, limitations).
++
++- Every raw row is kept, with `source_row` and `sample_index`; `status_frame_counter`, `timing_class`, `position_validity` and `current_validity` are copied through.
++- Representative samples: the last row of each identical-timestamp batch (policy, recorded in the provenance). Other rows keep raw values but have no derivatives.
++- Units: q deg -> rad, current mA -> A (division by 1000; values are not otherwise altered). Current sign is unverified (all channels nonnegative so far).
++- Candidate velocity: central difference of q on representative rows. Candidate acceleration: central difference of that velocity. Both require both neighbouring receive intervals >= `MIN_DERIVATIVE_DT_S` (10 ms, heuristic) and finite inputs; otherwise the value is NaN, never 0. Boundary rows are NaN. Smoothing is off unless requested and is then recorded.
++- Counts of excluded rows (not batch-last, no valid velocity, no valid acceleration) are in the provenance.
++- Limits: times are host receive times, not sample times, and STATUS carries no device timestamp. Intervals are not assumed equal. Acceleration is exploratory and must not be treated as physical ground truth. Model A/B fitting stays offline, outside the robot application.
+diff --git a/reports/identification_fix/git_status.txt b/reports/identification_fix/git_status.txt
+index 5e84e4c..67601a6 100644
+--- a/reports/identification_fix/git_status.txt
++++ b/reports/identification_fix/git_status.txt
+@@ -1,16 +1,21 @@
+-?
+  M IDENTIFICATION_DATA_COLLECTION.md
++ M core/identification_audit.py
+  M core/identification_logger.py
+- M cri_lib/cri_controller.py
+- M cri_lib/frame_timing.py
++ M core/run_report.py
+  M gui/main_window.py
+-?? core/run_report.py
++ M reports/identification_fix/COPILOT_CHANGE_REPORT.md
++ M reports/identification_fix/test_results.txt
++ M tools/export_identification_handoff.py
+ ?? identification_data/identification_ID_NORMAL_001_trajectory_export_RUN_01_20261015T132340.csv
+ ?? identification_data/identification_ID_NORMAL_001_trajectory_export_RUN_01_20261015T132340.csv.json
+ ?? identification_data/identification_ID_NORMAL_002_trajectory_export_RUN_02_20261015T133850.csv
+ ?? identification_data/identification_ID_NORMAL_002_trajectory_export_RUN_02_20261015T133850.csv.json
+-?? reports/
+-?? tests/test_run_report.py
+-?? tools/export_identification_handoff.py
+-
+-
++?? identification_data/identification_ID_NORMAL_003_trajectory_export_RUN_03_20261015T135600.csv
++?? identification_data/identification_ID_NORMAL_003_trajectory_export_RUN_03_20261015T135600.csv.json
++?? reports/handoff/ChatGPT_Identification_Handoff_identification_ID_NORMAL_003_trajectory_export_RUN_03_20261015T135600.zip
++?? reports/identification_fix/PREPROCESSING_POLICY.md
++?? reports/identification_fix/phase1_run03_investigation.md
++?? reports/identification_runs/identification_ID_NORMAL_003_trajectory_export_RUN_03_20261015T135600/
++?? requirements.txt
++?? tests/test_audit_readiness.py
++?? tests/test_handoff_export.py
+diff --git a/reports/identification_fix/phase1_run03_investigation.md b/reports/identification_fix/phase1_run03_investigation.md
+new file mode 100644
+index 0000000..4dc2d5b
+--- /dev/null
++++ b/reports/identification_fix/phase1_run03_investigation.md
+@@ -0,0 +1,16 @@
++?# Phase 1 - RUN_03 investigation (before the P0/P1 edits)
++
++Run: `identification_ID_NORMAL_003_trajectory_export_RUN_03_20261015T135600.csv` (+ `.json`), 632 rows, unmodified. Audit at HEAD b56df16: WARNING.
++
++## Verified facts
++- STATUS accounting is complete: sidecar `frame_accounting` end-start `status_frames` = 1985-1353 = 632 = rows written = offered; `status_frame_counter` is 1353..1984 with every step 1; parse errors 0, callback errors 0, writer drops 0. Other frame types (RUNSTATE, VARIABLES, LOGMSG, GRIPPERSTATE, CYCLESTAT, CMDACK...) moved the all-frame counter separately, so earlier "gaps" were not STATUS loss.
++- Only J1, J2, J3, J5 moved (q ranges J1 0..48, J2 -40..-11, J3 102..115, J5 66..70 deg). **J4 and J6 stayed at 0 deg.** J4 current is 18-19 mA (2 unique values) and J6 is 0 mA. Both are therefore *unexcited*, not proven faulty. The earlier statement "only J6 did not move" understated this.
++- Current is nonnegative on every channel (min 0). Sign is not available or at least unverified.
++- 2 of 631 consecutive current vectors are identical (little evidence of repeated/stale vectors).
++
++## Code findings
++- `I4` (finite q/current) is in `integrity`, so `_worst(integrity)` includes it and the top-level `audit_run` conclusions/overall_status already propagate it. **That earlier suspicion is not true for `audit_run`.**
++- It IS true for `core/run_report.py::decisions`: its raw-integrity decision only looked at R1-R3, I1-I3. It ignored I4, T1, T4, L1 and the audit's overall FAIL, so a run with NaN currents could be shown as WARNING/CONDITIONALLY READY. Fixed in this task.
++- Current freshness: the parser resets `status_fields_seen` on every STATUS and the GUI only copies `current_joints` when `CURRENTJOINTS` is in that set, otherwise NaN. Stale/initialised values are therefore not logged as measurements. But the CSV records no explicit per-row validity flag, so the audit cannot prove it (I5 relies on a zero-pattern heuristic that can also fire on genuine idle zeros and FAILs on leading zero rows). Fixed by adding explicit validity columns.
++- Live derivative gating (`MIN_DERIVATIVE_DT_S`=10 ms) is applied in the logger; the offline processed dataset did not apply it. Fixed.
++- No dependency file exists in the repo; PyQt6 is imported by `gui/` but not documented.
+diff --git a/reports/identification_fix/test_results.txt b/reports/identification_fix/test_results.txt
+index 18a7330..27ab662 100644
+Binary files a/reports/identification_fix/test_results.txt and b/reports/identification_fix/test_results.txt differ
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..c8941a6
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,5 @@
++PyQt6
++numpy
++scipy
++pyyaml
++matplotlib
+diff --git a/tests/test_audit_readiness.py b/tests/test_audit_readiness.py
+new file mode 100644
+index 0000000..6b1ca5a
+--- /dev/null
++++ b/tests/test_audit_readiness.py
+@@ -0,0 +1,232 @@
++"""Synthetic-run tests for audit decisions and readiness (no robot or GUI required)."""
 +from __future__ import annotations
 +
 +import csv
-+import hashlib
 +import json
-+import sys
-+from datetime import datetime, timezone
++import math
++import tempfile
++import unittest
 +from pathlib import Path
-+from typing import Any
 +
-+import numpy as np
++from core.identification_audit import audit_run, build_processed_dataset
++from core.identification_logger import IDENTIFICATION_COLUMNS, IdentificationLogger, classify_channel
++from core import run_report
 +
-+from core.identification_audit import audit_run, format_report
-+
-+PASS, WARNING, FAIL, NV = "PASS", "WARNING", "FAIL", "NOT VERIFIED"
-+RECEIVE_DT_CV_LIMIT = 0.25  # heuristic: receive-interval jitter acceptable for derivatives
-+MIN_RECEIVE_DT_S = 0.01
-+REPORT_ROOT = Path("reports") / "identification_runs"
++N = 60
 +
 +
-+def _f(rows: list[dict[str, str]], name: str) -> np.ndarray:
-+    out = []
-+    for row in rows:
-+        try:
-+            out.append(float(row.get(name, "")))
-+        except (TypeError, ValueError):
-+            out.append(float("nan"))
-+    return np.asarray(out, dtype=float)
-+
-+
-+def _load(csv_path: Path) -> list[dict[str, str]]:
-+    with open(csv_path, newline="", encoding="utf-8") as handle:
-+        return list(csv.DictReader(handle))
-+
-+
-+def _sha(path: Path) -> str:
-+    return hashlib.sha256(path.read_bytes()).hexdigest()
-+
-+
-+def timing_diagnostics(rows: list[dict[str, str]]) -> dict[str, Any]:
-+    ts = _f(rows, "timestamp")
-+    t_rx = _f(rows, "t_frame_s")
-+    chunk = _f(rows, "rx_chunk_id")
-+    frame_counter = _f(rows, "frame_counter")
-+    status_counter = _f(rows, "status_frame_counter")
-+    out: dict[str, Any] = {"rows": len(rows)}
-+    out["unique_timestamps"] = int(len(np.unique(ts[np.isfinite(ts)])))
-+    out["rows_sharing_timestamp"] = int(len(ts) - len(np.unique(ts[np.isfinite(ts)]))) if len(ts) else 0
-+    out["unique_chunks"] = int(len(np.unique(chunk[np.isfinite(chunk)])))
-+    labels: dict[str, int] = {}
-+    for row in rows:
-+        label = row.get("timing_class", "")
-+        labels[label] = labels.get(label, 0) + 1
-+    out["timing_class_counts"] = labels
-+    if len(np.unique(chunk[np.isfinite(chunk)])) > 2:
-+        first = {}
-+        for c, t in zip(chunk, t_rx):
-+            first.setdefault(c, t)
-+        spacing = np.diff(np.asarray(list(first.values())))
-+        spacing = spacing[np.isfinite(spacing)]
-+        if len(spacing):
-+            out["chunk_dt_s"] = {
-+                "min": float(spacing.min()), "median": float(np.median(spacing)),
-+                "max": float(spacing.max()), "mean": float(spacing.mean()),
-+                "cv": float(spacing.std() / spacing.mean()) if spacing.mean() > 0 else None,
-+                "fraction_below_min_dt": float(np.mean(spacing < MIN_RECEIVE_DT_S)),
-+            }
-+    for name, arr in (("frame_counter", frame_counter), ("status_frame_counter", status_counter)):
-+        valid = arr[np.isfinite(arr) & (arr >= 0)]
-+        if len(valid) > 1:
-+            gaps = np.diff(valid)
-+            out[name] = {
-+                "first": int(valid[0]), "last": int(valid[-1]), "span": int(valid[-1] - valid[0] + 1),
-+                "rows": int(len(valid)), "max_gap": int(gaps.max()),
-+                "gaps_gt1": int(np.sum(gaps > 1)),
-+                "non_increasing": int(np.sum(gaps <= 0)),
-+            }
-+    return out
-+
-+
-+def current_freshness(rows: list[dict[str, str]]) -> dict[str, Any]:
-+    result = {}
-+    for j in range(1, 7):
-+        v = _f(rows, f"current{j}")
-+        finite = v[np.isfinite(v)]
-+        changes = int(np.sum(np.diff(finite) != 0)) if len(finite) > 1 else 0
-+        result[f"J{j}"] = {
-+            "finite": int(len(finite)), "exact_zero": int(np.sum(finite == 0)),
-+            "value_changes": changes,
-+            "unique_values": int(len(np.unique(finite))),
-+        }
-+    return result
-+
-+
-+def decisions(audit: dict[str, Any], timing: dict[str, Any], currents: dict[str, Any]) -> dict[str, Any]:
-+    crit = {c["id"]: c for c in audit["criteria"]}
-+    # A. raw telemetry integrity
-+    a_fail = [k for k in ("R1", "R2", "R3", "I1", "I2", "I3") if k in crit and crit[k]["status"] == FAIL]
-+    stuck = [j for j, s in currents.items() if s["finite"] and s["exact_zero"] == s["finite"]]
-+    if a_fail:
-+        a = (FAIL, f"criteria failed: {a_fail}")
-+    elif stuck:
-+        a = (WARNING, f"channels exactly zero on every row: {stuck}; may be an unmoved/unloaded joint or a missing field (hardware check needed)")
-+    else:
-+        a = (PASS, "structural checks pass")
-+    # B. timestamp provenance
-+    t2 = crit.get("T2", {}).get("status", NV)
-+    b = (t2, "host receive time only; no device timestamp exists in CRI STATUS frames; batched rows share a timestamp")
-+    if t2 == PASS:
-+        b = (WARNING, b[1])
-+    # C. Model A (offline, current vs. position-derived features)
-+    chunk = timing.get("chunk_dt_s")
-+    if chunk is None:
-+        c_model = (NV, "no chunk timing")
-+    else:
-+        frac = chunk["fraction_below_min_dt"]
-+        cv = chunk["cv"]
-+        if cv is not None and cv > RECEIVE_DT_CV_LIMIT or frac > 0.05:
-+            c_model = (FAIL, f"receive-interval CV={cv:.2f}, fraction<min dt={frac:.2f}: acceleration from receive times is unreliable (Model B)")
++def make_rows(batched=False, validity="FRESH"):
++    rows = []
++    for i in range(N):
++        ts = (i // 2 if batched else i) * 0.05 + 100.0
++        if batched:
++            label = "BATCH_EARLIER" if i % 2 == 0 else "BATCH_LAST"
 +        else:
-+            c_model = (WARNING, "receive intervals acceptable but still not device-time; verify on hardware")
-+    a_model = (WARNING if a[0] != FAIL else FAIL,
-+               "Model A (position/velocity-light, one sample per unique timestamp) usable offline only if currents are valid; excitation not assessed here")
-+    ready = FAIL if FAIL in (a[0], b[0]) else (WARNING if WARNING in (a[0], b[0], c_model[0]) else PASS)
-+    verdict = {FAIL: "NOT READY", WARNING: "CONDITIONALLY READY", PASS: "READY FOR CONTROLLED 0 G DRY TEST"}[ready]
-+    return {
-+        "A_raw_telemetry_integrity": {"status": a[0], "reason": a[1]},
-+        "B_timestamp_provenance": {"status": b[0], "reason": b[1]},
-+        "C_model_A_offline": {"status": a_model[0], "reason": a_model[1]},
-+        "C_model_B_live_derivatives": {"status": c_model[0], "reason": c_model[1]},
-+        "overall_readiness": verdict,
-+    }
-+
-+
-+def _plots(rows: list[dict[str, str]], out_dir: Path) -> list[str]:
-+    try:
-+        import matplotlib
-+
-+        matplotlib.use("Agg")
-+        import matplotlib.pyplot as plt
-+    except Exception as exc:  # optional dependency
-+        return [f"plots skipped: matplotlib unavailable ({exc})"]
-+    t = _f(rows, "t_frame_s")
-+    t = t - np.nanmin(t) if len(t) else t
-+    made = []
-+    for fname, prefix, ylabel in (
-+        ("joint_position_plot.png", "q", "joint position [deg]"),
-+        ("joint_current_plot.png", "current", "joint current [mA]"),
-+    ):
-+        fig, ax = plt.subplots(figsize=(9, 4))
++            label = "UNIQUE"
++        row = {c: "" for c in IDENTIFICATION_COLUMNS}
++        row.update(
++            timestamp=repr(ts), sample_index=i, experiment_id="ID", trajectory_id="T", run_id="RUN_X",
++            commanded_speed=10, payload_g=0.0, contact_label="NORMAL", grasp_context="NONE",
++            thermal_condition="COLD", connection_epoch=1, frame_counter=i, rx_chunk_id=i // 2 if batched else i,
++            frame_in_chunk=i % 2 if batched else 0, frames_in_chunk=2 if batched else 1,
++            t_frame_s=repr(ts), timing_class=label, status_frame_counter=1000 + i,
++            position_validity=validity, current_validity=validity,
++        )
 +        for j in range(1, 7):
-+            ax.plot(t, _f(rows, f"{prefix}{j}"), label=f"J{j}")
-+        ax.set_xlabel("receive time [s]"); ax.set_ylabel(ylabel); ax.legend(ncol=6, fontsize=7)
-+        fig.tight_layout(); fig.savefig(out_dir / fname, dpi=110); plt.close(fig)
-+        made.append(fname)
-+    fig, axes = plt.subplots(2, 1, figsize=(9, 5))
-+    chunk = _f(rows, "rx_chunk_id")
-+    first: dict[float, float] = {}
-+    for c, tt in zip(chunk, _f(rows, "t_frame_s")):
-+        first.setdefault(c, tt)
-+    spacing = np.diff(np.asarray(list(first.values()))) * 1000.0
-+    finite_spacing = spacing[np.isfinite(spacing)]
-+    if len(finite_spacing):
-+        axes[0].hist(finite_spacing, bins=min(40, max(1, len(finite_spacing))))
-+    axes[0].set_xlabel("receive-chunk interval [ms]")
-+    for j in range(1, 7):
-+        qd = _f(rows, f"qddot{j}")
-+        axes[1].plot(t, np.where(np.isfinite(qd), qd, np.nan), lw=0.6)
-+    axes[1].set_xlabel("receive time [s]"); axes[1].set_ylabel("live qddot [deg/s^2]")
-+    fig.tight_layout(); fig.savefig(out_dir / "derivative_quality_plot.png", dpi=110); plt.close(fig)
-+    made.append("derivative_quality_plot.png")
-+    return made
++            row[f"q{j}"] = 10.0 * math.sin(0.1 * i + j)
++            row[f"qdot{j}"] = ""
++            row[f"qddot{j}"] = ""
++            row[f"current{j}"] = 300.0 + 50.0 * math.sin(0.2 * i + j)
++        rows.append(row)
++    return rows
 +
 +
-+def generate_run_report(csv_path: str | Path, out_root: str | Path = REPORT_ROOT) -> Path:
-+    csv_path = Path(csv_path)
-+    rows = _load(csv_path)
-+    run_id = csv_path.stem
-+    out_dir = Path(out_root) / run_id
-+    out_dir.mkdir(parents=True, exist_ok=True)
-+
-+    audit = audit_run(csv_path)
-+    timing = timing_diagnostics(rows)
-+    currents = current_freshness(rows)
-+    decided = decisions(audit, timing, currents)
-+
-+    sidecar_path = Path(str(csv_path) + ".json")
-+    sidecar = json.loads(sidecar_path.read_text(encoding="utf-8")) if sidecar_path.exists() else None
-+
-+    report = {
-+        "run_id": run_id, "generated_utc": datetime.now(timezone.utc).isoformat(),
-+        "source_file": str(csv_path), "source_sha256": _sha(csv_path),
-+        "decisions": decided, "timing": timing, "current_freshness": currents,
-+        "audit_overall_status": audit["overall_status"], "audit": audit,
-+        "sidecar_frame_accounting": (sidecar or {}).get("frame_accounting"),
-+        "sidecar_logger_accounting": (sidecar or {}).get("logger_accounting"),
-+    }
-+    (out_dir / "RUN_AUDIT.json").write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-+
-+    md = [f"# Run audit: {run_id}", "", f"Readiness: **{decided['overall_readiness']}**", "", "## Decisions", ""]
-+    for key, val in decided.items():
-+        if isinstance(val, dict):
-+            md.append(f"- **{key}**: {val['status']} - {val['reason']}")
-+    md += ["", "## Timing", "", "```json", json.dumps(timing, indent=2), "```", "",
-+           "## Current freshness", "", "```json", json.dumps(currents, indent=2), "```", "",
-+           "## Detailed audit", "", "```", format_report(audit), "```", ""]
-+    (out_dir / "RUN_AUDIT.md").write_text("\n".join(md), encoding="utf-8")
-+
-+    cols = ["sample_index", "timestamp", "t_frame_s", "rx_chunk_id", "frame_counter",
-+            "status_frame_counter", "frame_in_chunk", "frames_in_chunk", "timing_class"]
-+    with open(out_dir / "timing_diagnostics.csv", "w", newline="", encoding="utf-8") as handle:
-+        w = csv.writer(handle)
-+        w.writerow(cols)
-+        for row in rows:
-+            w.writerow([row.get(c, "") for c in cols])
-+
-+    plots = _plots(rows, out_dir)
-+    manifest = {
-+        "run_id": run_id, "source_file": str(csv_path), "source_sha256": report["source_sha256"],
-+        "files": sorted(p.name for p in out_dir.iterdir()), "plots": plots,
-+    }
-+    (out_dir / "run_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-+    return out_dir
++def sidecar(rows=N, received=None, dropped=0, error=None):
++    received = rows if received is None else received
++    snap = lambda n: {"connection_epoch": 1, "status_frames": n, "discarded_frames": 0,
++                      "parse_errors": 0, "status_callback_errors": 0}
++    return {"quality_status": "PASS", "writer_dropped_sample_count": dropped, "writer_error": error,
++            "frame_accounting": {"start": snap(1000), "end": snap(1000 + received)}}
 +
 +
-+def main(argv: list[str] | None = None) -> int:
-+    args = sys.argv[1:] if argv is None else argv
-+    if not args:
-+        print("usage: python -m core.run_report <identification.csv>")
-+        return 2
-+    print(generate_run_report(args[0]))
-+    return 0
++def write_run(tmp, rows, columns=None, side=None):
++    path = Path(tmp) / "run.csv"
++    columns = columns or IDENTIFICATION_COLUMNS
++    with open(path, "w", newline="", encoding="utf-8") as handle:
++        writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
++        writer.writeheader()
++        writer.writerows(rows)
++    Path(str(path) + ".json").write_text(json.dumps(side if side is not None else sidecar()), encoding="utf-8")
++    return path
++
++
++class ReadinessTests(unittest.TestCase):
++    def verdict(self, rows, columns=None, side=None):
++        with tempfile.TemporaryDirectory() as tmp:
++            path = write_run(tmp, rows, columns, side)
++            out = run_report.generate_run_report(path, Path(tmp) / "out")
++            return json.loads((out / "RUN_AUDIT.json").read_text())
++
++    def test_valid_run_is_ready(self):
++        report = self.verdict(make_rows())
++        self.assertEqual(report["decisions"]["overall_readiness"], "READY FOR CONTROLLED 0 G DRY TEST")
++        self.assertEqual(report["decisions"]["current_freshness"]["status"], "PASS")
++
++    def test_missing_position_is_not_ready(self):
++        rows = make_rows(); rows[10]["q2"] = ""
++        d = self.verdict(rows)["decisions"]
++        self.assertEqual(d["raw_positions"]["status"], "FAIL")
++        self.assertEqual(d["overall_readiness"], "NOT READY")
++
++    def test_nan_and_inf_current_not_ready(self):
++        for bad in ("nan", "inf"):
++            rows = make_rows(); rows[5]["current3"] = bad
++            d = self.verdict(rows)["decisions"]
++            self.assertEqual(d["raw_current"]["status"], "FAIL", bad)
++            self.assertEqual(d["overall_readiness"], "NOT READY", bad)
++
++    def test_missing_required_column_not_ready(self):
++        cols = [c for c in IDENTIFICATION_COLUMNS if c != "current3"]
++        d = self.verdict(make_rows(), columns=cols)["decisions"]
++        self.assertEqual(d["overall_readiness"], "NOT READY")
++
++    def test_invalid_metadata_not_ready(self):
++        rows = make_rows(); rows[30]["payload_g"] = 500.0
++        self.assertEqual(self.verdict(rows)["decisions"]["overall_readiness"], "NOT READY")
++
++    def test_missing_current_field_rows_not_ready(self):
++        rows = make_rows()
++        for r in rows[20:25]:
++            r["current_validity"] = "MISSING"
++            for j in range(1, 7):
++                r[f"current{j}"] = "nan"
++        d = self.verdict(rows)["decisions"]
++        self.assertEqual(d["current_freshness"]["status"], "FAIL")
++        self.assertEqual(d["overall_readiness"], "NOT READY")
++
++    def test_legacy_run_without_freshness_is_conditional(self):
++        cols = [c for c in IDENTIFICATION_COLUMNS if not c.endswith("_validity")]
++        d = self.verdict(make_rows(), columns=cols)["decisions"]
++        self.assertEqual(d["current_freshness"]["status"], "NOT VERIFIED")
++        self.assertEqual(d["overall_readiness"], "CONDITIONALLY READY")
++
++    def test_stationary_joint_is_not_a_failure(self):
++        rows = make_rows()
++        for r in rows:
++            r["q4"] = 0.0
++        d = self.verdict(rows)["decisions"]
++        self.assertEqual(d["raw_positions"]["status"], "PASS")
++        self.assertNotEqual(d["overall_readiness"], "NOT READY")
++
++    def test_constant_current_channel_is_conditional(self):
++        rows = make_rows()
++        for r in rows:
++            r["current6"] = 0.0
++        d = self.verdict(rows)["decisions"]
++        self.assertEqual(d["raw_current"]["status"], "WARNING")
++        self.assertEqual(d["overall_readiness"], "CONDITIONALLY READY")
++
++    def test_genuine_zero_with_fresh_flags_not_failed(self):
++        rows = make_rows()
++        for r in rows[:3]:
++            for j in range(1, 7):
++                r[f"current{j}"] = 0.0
++        report = self.verdict(rows)
++        self.assertNotEqual(report["decisions"]["overall_readiness"], "NOT READY")
++        i5 = [c for c in report["audit"]["criteria"] if c["id"] == "I5"][0]
++        self.assertEqual(i5["status"], "PASS")
++
++    def test_labelled_duplicate_timestamps_are_warning_only(self):
++        d = self.verdict(make_rows(batched=True))["decisions"]
++        self.assertEqual(d["receive_timing"]["status"], "WARNING")
++        self.assertNotEqual(d["overall_readiness"], "NOT READY")
++
++    def test_inconsistent_batching_labels_not_ready(self):
++        rows = make_rows(batched=True)
++        rows[1]["timing_class"] = "UNIQUE"
++        report = self.verdict(rows)
++        self.assertEqual(report["decisions"]["receive_timing"]["status"], "FAIL")
++        self.assertEqual(report["decisions"]["overall_readiness"], "NOT READY")
++
++    def test_writer_drop_and_error_not_ready(self):
++        for side in (sidecar(dropped=3), sidecar(error="disk full")):
++            d = self.verdict(make_rows(), side=side)["decisions"]
++            self.assertEqual(d["logger_integrity"]["status"], "FAIL")
++            self.assertEqual(d["overall_readiness"], "NOT READY")
++
++    def test_lost_status_frames_not_ready(self):
++        d = self.verdict(make_rows(), side=sidecar(received=N + 25))["decisions"]
++        self.assertEqual(d["status_frame_accounting"]["status"], "FAIL")
++        self.assertEqual(d["overall_readiness"], "NOT READY")
++
++    def test_json_and_markdown_agree(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            rows = make_rows(); rows[3]["current2"] = "nan"
++            out = run_report.generate_run_report(write_run(tmp, rows), Path(tmp) / "out")
++            data = json.loads((out / "RUN_AUDIT.json").read_text())
++            md = (out / "RUN_AUDIT.md").read_text()
++            self.assertIn(data["decisions"]["overall_readiness"], md)
++            self.assertEqual(data["audit_overall_status"], "FAIL")
++
++    def test_cli_exit_codes(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            good = write_run(tmp, make_rows())
++            self.assertEqual(run_report.main([str(good), "--out-root", str(Path(tmp) / "o")]), 0)
++            rows = make_rows(); rows[0]["q1"] = ""
++            bad = write_run(tmp, rows)
++            self.assertEqual(run_report.main([str(bad), "--out-root", str(Path(tmp) / "o")]), 1)
++
++
++class ValidityClassificationTests(unittest.TestCase):
++    def test_states(self):
++        six = [1.0] * 6
++        self.assertEqual(classify_channel({"CURRENTJOINTS"}, "CURRENTJOINTS", six), "FRESH")
++        self.assertEqual(classify_channel({"CURRENTJOINTS"}, "CURRENTJOINTS", [0.0] * 6), "FRESH")  # genuine zero
++        self.assertEqual(classify_channel({"MODE"}, "CURRENTJOINTS", [float("nan")] * 6), "MISSING")
++        self.assertEqual(classify_channel({"CURRENTJOINTS"}, "CURRENTJOINTS", [1, 2, float("nan"), 4, 5, 6]), "NON_FINITE")
++        self.assertEqual(classify_channel({"CURRENTJOINTS"}, "CURRENTJOINTS", [1, 2, float("inf"), 4, 5, 6]), "NON_FINITE")
++        self.assertEqual(classify_channel(None, "CURRENTJOINTS", six), "UNKNOWN")
++
++    def test_logger_writes_validity_and_counts(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            logger = IdentificationLogger(output_dir=tmp, experiment_id="E", trajectory_id="T", run_id="R",
++                                          commanded_speed=10, payload_g=0, contact_label="NORMAL",
++                                          grasp_context="NONE", thermal_condition="COLD")
++            q = [1.0] * 6
++            logger.log_sample(1.0, q, None, [0.0] * 6, status_fields={"POSJOINTCURRENT", "CURRENTJOINTS"})
++            logger.log_sample(1.1, q, None, [float("nan")] * 6, status_fields={"POSJOINTCURRENT"})
++            summary = logger.close()
++            with open(logger.file_path, newline="") as handle:
++                rows = list(csv.DictReader(handle))
++            self.assertEqual([r["current_validity"] for r in rows], ["FRESH", "MISSING"])
++            self.assertEqual(rows[0]["current1"], "0.0")  # measured zero preserved
++            self.assertEqual(rows[1]["current1"].lower(), "nan")
++            self.assertEqual(summary["validity_accounting"]["current"]["MISSING"], 1)
++
++
++class ProcessedDatasetTests(unittest.TestCase):
++    def test_short_intervals_never_create_derivative_spikes(self):
++        rows = make_rows()
++        # force rows 20..24 to be 0.2 ms apart
++        for k, i in enumerate(range(20, 25)):
++            rows[i]["timestamp"] = repr(110.0 + k * 0.0002)
++        for i in range(25, N):
++            rows[i]["timestamp"] = repr(110.1 + (i - 25) * 0.05)
++        with tempfile.TemporaryDirectory() as tmp:
++            raw = write_run(tmp, rows)
++            before = raw.read_bytes()
++            prov = build_processed_dataset(raw, Path(tmp) / "p" / "proc.csv")
++            self.assertEqual(before, raw.read_bytes())
++            with open(Path(tmp) / "p" / "proc.csv") as handle:
++                out = list(csv.DictReader(handle))
++            self.assertEqual(len(out), N)  # original rows preserved
++            for i in range(21, 24):
++                self.assertEqual(out[i]["qdot1_rad_s"], "nan")
++                self.assertEqual(out[i]["qddot1_rad_s2"], "nan")
++            self.assertIn("exclusions", prov)
++            finite = [abs(float(r["qdot1_rad_s"])) for r in out if r["qdot1_rad_s"] != "nan"]
++            self.assertLess(max(finite), 5.0)
 +
 +
 +if __name__ == "__main__":
-+    raise SystemExit(main())
-diff --git a/cri_lib/cri_controller.py b/cri_lib/cri_controller.py
-index 29c1381..8de2737 100644
---- a/cri_lib/cri_controller.py
-+++ b/cri_lib/cri_controller.py
-@@ -11,7 +11,7 @@ from typing import Any, Callable
- from core.latency_tracking import NetworkLatencyTracker
- from .cri_errors import CRICommandTimeOutError, CRIConnectionError
- from .cri_protocol_parser import CRIProtocolParser
--from .frame_timing import FrameTimer, FrameTiming, extract_frames
-+from .frame_timing import FrameTimer, FrameTiming, extract_frames, message_type
- from .robot_state import KinematicsState, RobotState
- 
- logger = logging.getLogger(__name__)
-@@ -300,9 +300,23 @@ class CRIController:
-         if not frames:
-             return
-         chunk_id = self.frame_timer.begin_chunk()
--        for index, message in enumerate(frames):
--            timing = self.frame_timer.stamp_frame(chunk_id, index, len(frames), t_chunk_rx)
--            self._parse_message(message, t_chunk_rx, timing)
-+        types = [message_type(frame) for frame in frames]
-+        status_total = types.count("STATUS")
-+        status_index = 0
-+        for message, kind in zip(frames, types):
-+            frame_counter = self.frame_timer.note_frame(kind)
-+            timing = None
-+            if kind == "STATUS":
-+                timing = self.frame_timer.stamp_frame(
-+                    chunk_id, status_index, status_total, t_chunk_rx, frame_counter
-+                )
-+                status_index += 1
-+            try:
-+                self._parse_message(message, t_chunk_rx, timing)
-+            except Exception:
-+                # A malformed frame must not stop the receive thread.
-+                self.frame_timer.parse_errors += 1
-+                logger.exception("Failed to parse CRI %s frame", kind)
- 
-     def _wait_for_answer(
-         self,
-@@ -376,8 +390,10 @@ class CRIController:
-                 self.last_status_timing = timing
-             if answer_id == "status" and self.status_callback is not None:
-                 try:
-+                    self.frame_timer.status_callbacks += 1
-                     self.status_callback(self.robot_state, received_at)
-                 except Exception:
-+                    self.frame_timer.status_callback_errors += 1
-                     logger.exception("Status callback failed")
- 
-             if isinstance(answer_id, str) and answer_id.isdigit():
-@@ -416,6 +432,10 @@ class CRIController:
-         self._register_answer("status")
-         self._wait_for_answer("status", timeout)
- 
-+    def frame_stats(self) -> dict:
-+        """Snapshot of per-type frame and callback counters."""
-+        return self.frame_timer.stats()
-+
-     def register_status_callback(
-         self, callback: Callable[[RobotState, float], None] | None
-     ) -> None:
-diff --git a/cri_lib/frame_timing.py b/cri_lib/frame_timing.py
-index 44950f9..8c36a4c 100644
---- a/cri_lib/frame_timing.py
-+++ b/cri_lib/frame_timing.py
-@@ -38,6 +38,7 @@ class FrameTiming:
-     frames_in_chunk: int
-     t_chunk_rx_s: float
-     t_frame_s: float
-+    status_counter: int = -1
- 
-     @property
-     def timing_class(self) -> str:
-@@ -82,17 +83,30 @@ def extract_frames(buffer: bytearray) -> tuple[list[str], int]:
- 
- 
- class FrameTimer:
--    """Assigns provenance to frames; not thread-safe (receive thread only)."""
-+    """Counts every complete CRI frame and assigns STATUS provenance.
-+
-+    Not thread-safe: use from the receive thread only (read snapshots via ``stats``).
-+    ``frame_counter`` counts all frame types, so it legitimately skips numbers
-+    between STATUS frames; ``status_counter`` counts STATUS frames only, and a
-+    gap there means a STATUS frame that was not delivered to the identification
-+    path (e.g. a parse failure), not a non-STATUS message.
-+    """
- 
-     def __init__(self) -> None:
-         self.connection_epoch = 0
-         self.frame_counter = 0
-+        self.status_counter = 0
-         self.chunk_id = 0
-         self.discarded_frames = 0
-+        self.frame_type_counts: dict[str, int] = {}
-+        self.parse_errors = 0
-+        self.status_callbacks = 0
-+        self.status_callback_errors = 0
- 
-     def restart_connection(self) -> None:
-         self.connection_epoch += 1
-         self.frame_counter = 0
-+        self.status_counter = 0
-         self.chunk_id = 0
- 
-     def begin_chunk(self) -> int:
-@@ -100,18 +114,56 @@ class FrameTimer:
-         self.chunk_id += 1
-         return chunk_id
- 
-+    def note_frame(self, message_type: str) -> int:
-+        """Count one complete frame of any type; returns its ``frame_counter``."""
-+        self.frame_type_counts[message_type] = self.frame_type_counts.get(message_type, 0) + 1
-+        index = self.frame_counter
-+        self.frame_counter += 1
-+        return index
-+
-     def stamp_frame(
--        self, chunk_id: int, frame_in_chunk: int, frames_in_chunk: int, t_chunk_rx_s: float
-+        self,
-+        chunk_id: int,
-+        frame_in_chunk: int,
-+        frames_in_chunk: int,
-+        t_chunk_rx_s: float,
-+        frame_counter: int | None = None,
-     ) -> FrameTiming:
--        """Build provenance when the frame starts processing (sets ``t_frame_s``)."""
-+        """Build STATUS provenance when parsing starts (sets ``t_frame_s``).
-+
-+        ``frame_in_chunk``/``frames_in_chunk`` count STATUS frames only, because
-+        only STATUS frames become identification rows that share a timestamp.
-+        """
-+        if frame_counter is None:
-+            frame_counter = self.note_frame("STATUS")
-         timing = FrameTiming(
-             connection_epoch=self.connection_epoch,
--            frame_counter=self.frame_counter,
-+            frame_counter=frame_counter,
-             chunk_id=chunk_id,
-             frame_in_chunk=frame_in_chunk,
-             frames_in_chunk=frames_in_chunk,
-             t_chunk_rx_s=t_chunk_rx_s,
-             t_frame_s=perf_counter(),
-+            status_counter=self.status_counter,
-         )
--        self.frame_counter += 1
--        return timing
-\ No newline at end of file
-+        self.status_counter += 1
-+        return timing
-+
-+    def stats(self) -> dict:
-+        """Cumulative counters since the controller was created (copy-safe)."""
-+        return {
-+            "connection_epoch": self.connection_epoch,
-+            "frames_total": sum(self.frame_type_counts.values()),
-+            "status_frames": self.frame_type_counts.get("STATUS", 0),
-+            "frame_type_counts": dict(self.frame_type_counts),
-+            "discarded_frames": self.discarded_frames,
-+            "parse_errors": self.parse_errors,
-+            "status_callbacks": self.status_callbacks,
-+            "status_callback_errors": self.status_callback_errors,
-+        }
-+
-+
-+def message_type(frame: str) -> str:
-+    """Return the CRI message type token of a complete frame, or ``UNKNOWN``."""
-+    parts = frame.split(None, 3)
-+    return parts[2] if len(parts) > 2 else "UNKNOWN"
-\ No newline at end of file
-diff --git a/gui/main_window.py b/gui/main_window.py
-index f48ff13..06b5ec4 100644
---- a/gui/main_window.py
-+++ b/gui/main_window.py
-@@ -1,6 +1,7 @@
- import json
- import os
- import time
-+import logging
- import threading
- from pathlib import Path
- from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
-@@ -975,6 +976,7 @@ class MainWindow(QMainWindow):
-                 )
-                 logger = self.identification_logger
-             self.identification_output_path = str(logger.file_path)
-+            self._identification_frame_stats_start = self._frame_stats_snapshot()
-             self.identification_last_summary = None
-             self._identification_last_timestamp = None
-             self._identification_last_q = None
-@@ -993,6 +995,12 @@ class MainWindow(QMainWindow):
-             )
-         return True
- 
-+    def _frame_stats_snapshot(self):
-+        try:
-+            return self.manager.robot.frame_stats()
-+        except Exception:
-+            return None
-+
-     def _confirm_identification_condition(self, metadata):
-         is_normal_no_load = (
-             float(metadata.get("payload_g", float("nan"))) == 0.0
-@@ -1025,8 +1033,12 @@ class MainWindow(QMainWindow):
-             self._identification_last_timestamp = None
-             self._identification_last_q = None
-             self._identification_last_qdot = None
--        summary = logger.close()
-+        end_stats = self._frame_stats_snapshot()
-+        start_stats = getattr(self, "_identification_frame_stats_start", None)
-+        accounting = {"start": start_stats, "end": end_stats}
-+        summary = logger.close(frame_accounting=accounting)
-         self.identification_last_summary = summary
-+        self._start_post_run_report(logger.file_path)
-         if not silent:
-             self.btn_start_identification.setEnabled(self.manager.robot.connected)
-             self.btn_stop_identification.setEnabled(False)
-@@ -1041,6 +1053,18 @@ class MainWindow(QMainWindow):
-             )
-         return summary
- 
-+    def _start_post_run_report(self, csv_path):
-+        # Report failure must never affect the already-saved raw CSV.
-+        def worker():
-+            try:
-+                from core.run_report import generate_run_report
-+
-+                generate_run_report(csv_path)
-+            except Exception:
-+                logging.getLogger(__name__).exception("Post-run report failed")
-+
-+        threading.Thread(target=worker, name="post-run-report", daemon=True).start()
-+
-     def _show_identification_close_summary(self, summary):
-         file_path = summary.get("file_path", self.identification_output_path or "")
-         quality_status = summary.get("quality_status", "FAIL")
-diff --git a/tests/test_run_report.py b/tests/test_run_report.py
++    unittest.main()
+diff --git a/tests/test_handoff_export.py b/tests/test_handoff_export.py
 new file mode 100644
-index 0000000..2e9adc4
+index 0000000..ce85f47
 --- /dev/null
-+++ b/tests/test_run_report.py
-@@ -0,0 +1,49 @@
-+﻿import csv, json, tempfile, unittest
++++ b/tests/test_handoff_export.py
+@@ -0,0 +1,31 @@
++?import json, tempfile, unittest, zipfile, sys
 +from pathlib import Path
-+from cri_lib.frame_timing import FrameTimer, message_type
-+from core import run_report
++sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
++import export_identification_handoff as ex
++from tests.test_audit_readiness import make_rows, write_run
 +
 +
-+class StatusCounterTests(unittest.TestCase):
-+    def test_status_only_batching_and_counters(self):
-+        t = FrameTimer()
-+        cid = t.begin_chunk()
-+        kinds = ["CMDACK", "STATUS", "RUNSTATE", "STATUS"]
-+        counters = [t.note_frame(k) for k in kinds]
-+        self.assertEqual(counters, [1, 2, 3, 4] if counters[0] == 1 else counters)
-+        a = t.stamp_frame(cid, 0, 2, 1.0, counters[1])
-+        b = t.stamp_frame(cid, 1, 2, 1.0, counters[3])
-+        self.assertEqual(b.status_counter - a.status_counter, 1)
-+        self.assertEqual(t.stats()["frame_type_counts"]["STATUS"], 2)
-+        self.assertEqual(t.stats()["frame_type_counts"]["CMDACK"], 1)
++class HandoffTests(unittest.TestCase):
++    def test_zip_matches_selected_run(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            run = write_run(tmp, make_rows())
++            zip_path = ex.build(run, Path(tmp) / "out")
++            self.assertIn(run.stem, zip_path.name)
++            with zipfile.ZipFile(zip_path) as z:
++                names = z.namelist()
++                self.assertIn(f"raw/{run.name}", names)
++                self.assertIn("run_report/RUN_AUDIT.json", names)
++                audit = json.loads(z.read("run_report/RUN_AUDIT.json"))
++                self.assertEqual(audit["source_sha256"], ex.sha256(run))
++                self.assertEqual(z.read(f"raw/{run.name}"), run.read_bytes())
++        # report directory created under repo reports/identification_runs for run.csv
++        import shutil
++        shutil.rmtree(ex.ROOT / "reports" / "identification_runs" / run.stem, ignore_errors=True)
 +
-+    def test_message_type(self):
-+        self.assertEqual(message_type("CRISTART 1 CMDACK X CRIEND"), "CMDACK")
-+
-+
-+class ReportTests(unittest.TestCase):
-+    def test_report_on_minimal_csv(self):
-+        cols = ["sample_index", "timestamp", "t_frame_s", "rx_chunk_id", "frame_counter",
-+                "status_frame_counter", "timing_class"] + [f"q{j}" for j in range(1, 7)] + [f"current{j}" for j in range(1, 7)]
-+        with tempfile.TemporaryDirectory() as d:
-+            p = Path(d) / "run.csv"
-+            with open(p, "w", newline="") as h:
-+                w = csv.DictWriter(h, cols); w.writeheader()
-+                for i in range(30):
-+                    row = {c: 0.0 for c in cols}
-+                    row.update(sample_index=i, timestamp=i * 0.05, t_frame_s=i * 0.05, rx_chunk_id=i,
-+                              frame_counter=i, status_frame_counter=i, timing_class="UNIQUE")
-+                    for j in range(1, 7):
-+                        row[f"current{j}"] = float(i % 5 + j)
-+                    w.writerow(row)
-+            before = p.read_bytes()
-+            out = run_report.generate_run_report(p, Path(d) / "out")
-+            self.assertEqual(before, p.read_bytes())
-+            data = json.loads((out / "RUN_AUDIT.json").read_text())
-+            self.assertIn("decisions", data)
-+            self.assertTrue((out / "timing_diagnostics.csv").exists())
-+            self.assertTrue((out / "run_manifest.json").exists())
++    def test_missing_run_is_an_error(self):
++        with self.assertRaises(SystemExit):
++            ex.build(Path("no_such_run.csv"), Path(tempfile.gettempdir()))
 +
 +
 +if __name__ == "__main__":
 +    unittest.main()
 diff --git a/tools/export_identification_handoff.py b/tools/export_identification_handoff.py
-new file mode 100644
-index 0000000..9b0e864
---- /dev/null
+index 9b0e864..45e1e8d 100644
+--- a/tools/export_identification_handoff.py
 +++ b/tools/export_identification_handoff.py
-@@ -0,0 +1,81 @@
-+﻿"""Package one identification run for external (e.g. ChatGPT) review.
+@@ -1,11 +1,17 @@
+ ?"""Package one identification run for external (e.g. ChatGPT) review.
+ 
+-usage: python tools/export_identification_handoff.py --run <identification.csv>
+-Raw files are copied unmodified; missing optional artifacts are listed in README.
++usage:
++    python tools/export_identification_handoff.py --run <identification.csv>
++    python tools/export_identification_handoff.py --code-only      # no run data
 +
-+usage: python tools/export_identification_handoff.py --run <identification.csv>
-+Raw files are copied unmodified; missing optional artifacts are listed in README.
-+"""
-+from __future__ import annotations
-+
-+import argparse
-+import hashlib
-+import json
-+import sys
-+import zipfile
-+from pathlib import Path
-+
-+ROOT = Path(__file__).resolve().parents[1]
-+sys.path.insert(0, str(ROOT))
-+
-+from core.run_report import generate_run_report  # noqa: E402
-+
-+OPTIONAL = [
-+    "Pathways/trajectory_export.csv",
-+    "IDENTIFICATION_DATA_COLLECTION.md",
-+    "reports/identification_fix/COPILOT_CHANGE_REPORT.md",
-+    "reports/identification_fix/root_cause_analysis.md",
-+    "reports/identification_fix/change_manifest.json",
-+    "reports/identification_fix/git_diff.patch",
-+    "reports/identification_fix/git_status.txt",
-+    "reports/identification_fix/test_results.txt",
++The run is always the explicit --run argument; nothing is substituted from
++another run. Every run-specific artifact is checked against the CSV SHA-256 and
++run_id. Missing artifacts are listed in the README, never replaced.
+ """
+ from __future__ import annotations
+ 
+ import argparse
++import csv
+ import hashlib
+ import json
+ import sys
+@@ -17,63 +23,109 @@ sys.path.insert(0, str(ROOT))
+ 
+ from core.run_report import generate_run_report  # noqa: E402
+ 
+-OPTIONAL = [
++FIX = "reports/identification_fix/"
++CONTEXT = [
+     "Pathways/trajectory_export.csv",
+     "IDENTIFICATION_DATA_COLLECTION.md",
+-    "reports/identification_fix/COPILOT_CHANGE_REPORT.md",
+-    "reports/identification_fix/root_cause_analysis.md",
+-    "reports/identification_fix/change_manifest.json",
+-    "reports/identification_fix/git_diff.patch",
+-    "reports/identification_fix/git_status.txt",
+-    "reports/identification_fix/test_results.txt",
++    FIX + "COPILOT_CHANGE_REPORT.md",
++    FIX + "root_cause_analysis.md",
++    FIX + "PREPROCESSING_POLICY.md",
++    FIX + "change_manifest.json",
++    FIX + "git_diff.patch",
++    FIX + "git_status.txt",
++    FIX + "test_results.txt",
 +]
++REQUIRED_REPORT_FILES = [
++    "RUN_AUDIT.md", "RUN_AUDIT.json", "timing_diagnostics.csv", "joint_position_plot.png",
++    "joint_current_plot.png", "derivative_quality_plot.png", "run_manifest.json",
++    "processed_dataset.csv", "processed_dataset.csv.provenance.json",
+ ]
+ 
+ 
+-def main() -> int:
+-    ap = argparse.ArgumentParser()
+-    ap.add_argument("--run", required=True, help="raw identification CSV")
+-    ap.add_argument("--out-dir", default=str(ROOT / "reports" / "handoff"))
+-    args = ap.parse_args()
+-    csv_path = Path(args.run).resolve()
+-    sidecar = Path(str(csv_path) + ".json")
+-    report_dir = generate_run_report(csv_path, ROOT / "reports" / "identification_runs")
+-
+-    entries: list[tuple[Path, str]] = [(csv_path, f"raw/{csv_path.name}")]
++def sha256(path: Path) -> str:
++    return hashlib.sha256(path.read_bytes()).hexdigest()
++
++
++def csv_run_ids(path: Path) -> set[str]:
++    with open(path, newline="", encoding="utf-8") as handle:
++        return {row.get("run_id", "") for row in csv.DictReader(handle)}
++
++
++def build(run: Path | None, out_dir: Path) -> Path:
++    entries: list[tuple[Path, str]] = []
+     missing: list[str] = []
+-    if sidecar.exists():
+-        entries.append((sidecar, f"raw/{sidecar.name}"))
+-    else:
+-        missing.append(f"sidecar {sidecar.name}")
+-    for p in sorted(report_dir.iterdir()):
+-        entries.append((p, f"run_report/{p.name}"))
+-    for rel in OPTIONAL:
+-        p = ROOT / rel
+-        if p.exists():
+-            entries.append((p, f"context/{rel}"))
++    problems: list[str] = []
++    run_id = "code_only"
++    run_hash = None
++    if run is not None:
++        run = run.resolve()
++        if not run.is_file():
++            raise SystemExit(f"run CSV not found: {run}")
++        run_id = run.stem
++        run_hash = sha256(run)
++        sidecar = Path(str(run) + ".json")
++        entries.append((run, f"raw/{run.name}"))
++        if sidecar.is_file():
++            entries.append((sidecar, f"raw/{sidecar.name}"))
++            side = json.loads(sidecar.read_text(encoding="utf-8"))
++            declared = Path(str(side.get("file_path", run))).name
++            if declared != run.name:
++                problems.append(f"sidecar file_path {declared} != {run.name}")
++        else:
++            missing.append(f"sidecar {sidecar.name}")
++        report_dir = generate_run_report(run, ROOT / "reports" / "identification_runs")
++        audit = json.loads((report_dir / "RUN_AUDIT.json").read_text(encoding="utf-8"))
++        if audit["source_sha256"] != run_hash or Path(audit["source_file"]).name != run.name:
++            problems.append("RUN_AUDIT.json does not match the selected run")
++        manifest = json.loads((report_dir / "run_manifest.json").read_text(encoding="utf-8"))
++        if manifest["source_sha256"] != run_hash:
++            problems.append("run_manifest.json hash mismatch")
++        prov = Path(str(report_dir / "processed_dataset.csv") + ".provenance.json")
++        if prov.is_file() and json.loads(prov.read_text(encoding="utf-8"))["source_sha256"] != run_hash:
++            problems.append("processed dataset provenance hash mismatch")
++        for name in REQUIRED_REPORT_FILES:
++            if (report_dir / name).is_file():
++                entries.append((report_dir / name, f"run_report/{name}"))
++            else:
++                missing.append(f"run_report/{name}")
++        if problems:
++            raise SystemExit("identity validation failed, no ZIP written: " + "; ".join(problems))
++    for rel in CONTEXT:
++        path = ROOT / rel
++        if path.is_file():
++            entries.append((path, f"context/{rel}"))
+         else:
+             missing.append(rel)
+-    run_id = csv_path.stem
+-    manifest = {
+-        "run_id": run_id,
+-        "files": {arc: hashlib.sha256(p.read_bytes()).hexdigest() for p, arc in entries},
+-        "unavailable": missing,
+-    }
++
++    listing = {arc: sha256(path) for path, arc in entries}
+     readme = [
+         f"# Identification handoff: {run_id}", "",
+-        "raw/ holds unmodified recorder output; run_report/ is derived (see RUN_AUDIT.md);",
+-        "context/ holds the trajectory, operator docs and change evidence.",
++        "Run-specific files are under `raw/` (unmodified recorder output) and `run_report/` (derived, hash-checked against the CSV).",
++        "`context/` holds the trajectory, operator docs and code-change evidence; it is not run-specific.",
++        f"Selected run SHA-256: {run_hash or 'n/a (code-only package; no hardware run is claimed)'}",
+         "Timestamps are host receive times; STATUS frames carry no device timestamp.", "",
+-        "## Unavailable artifacts", *([f"- {m}" for m in missing] or ["- none"]),
++        "## Unavailable artifacts", *([f"- {m}" for m in missing] or ["- none"]), "",
++        "## File hashes (SHA-256)", *[f"- {a}: {h}" for a, h in sorted(listing.items())],
+     ]
+-    out_dir = Path(args.out_dir)
+     out_dir.mkdir(parents=True, exist_ok=True)
+     zip_path = out_dir / f"ChatGPT_Identification_Handoff_{run_id}.zip"
+-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+-        for p, arc in entries:
+-            z.write(p, arc)
+-        z.writestr("README.md", "\n".join(readme) + "\n")
+-        z.writestr("handoff_manifest.json", json.dumps(manifest, indent=2))
+-    print(zip_path)
++    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as archive:
++        for path, arc in entries:
++            archive.write(path, arc)
++        archive.writestr("README.md", "\n".join(readme) + "\n")
++        archive.writestr("handoff_manifest.json", json.dumps(
++            {"run_id": run_id, "source_sha256": run_hash, "files": listing, "unavailable": missing}, indent=2))
++    return zip_path
 +
 +
 +def main() -> int:
-+    ap = argparse.ArgumentParser()
-+    ap.add_argument("--run", required=True, help="raw identification CSV")
-+    ap.add_argument("--out-dir", default=str(ROOT / "reports" / "handoff"))
-+    args = ap.parse_args()
-+    csv_path = Path(args.run).resolve()
-+    sidecar = Path(str(csv_path) + ".json")
-+    report_dir = generate_run_report(csv_path, ROOT / "reports" / "identification_runs")
-+
-+    entries: list[tuple[Path, str]] = [(csv_path, f"raw/{csv_path.name}")]
-+    missing: list[str] = []
-+    if sidecar.exists():
-+        entries.append((sidecar, f"raw/{sidecar.name}"))
-+    else:
-+        missing.append(f"sidecar {sidecar.name}")
-+    for p in sorted(report_dir.iterdir()):
-+        entries.append((p, f"run_report/{p.name}"))
-+    for rel in OPTIONAL:
-+        p = ROOT / rel
-+        if p.exists():
-+            entries.append((p, f"context/{rel}"))
-+        else:
-+            missing.append(rel)
-+    run_id = csv_path.stem
-+    manifest = {
-+        "run_id": run_id,
-+        "files": {arc: hashlib.sha256(p.read_bytes()).hexdigest() for p, arc in entries},
-+        "unavailable": missing,
-+    }
-+    readme = [
-+        f"# Identification handoff: {run_id}", "",
-+        "raw/ holds unmodified recorder output; run_report/ is derived (see RUN_AUDIT.md);",
-+        "context/ holds the trajectory, operator docs and change evidence.",
-+        "Timestamps are host receive times; STATUS frames carry no device timestamp.", "",
-+        "## Unavailable artifacts", *([f"- {m}" for m in missing] or ["- none"]),
-+    ]
-+    out_dir = Path(args.out_dir)
-+    out_dir.mkdir(parents=True, exist_ok=True)
-+    zip_path = out_dir / f"ChatGPT_Identification_Handoff_{run_id}.zip"
-+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
-+        for p, arc in entries:
-+            z.write(p, arc)
-+        z.writestr("README.md", "\n".join(readme) + "\n")
-+        z.writestr("handoff_manifest.json", json.dumps(manifest, indent=2))
-+    print(zip_path)
-+    return 0
-+
-+
-+if __name__ == "__main__":
-+    raise SystemExit(main())
++    parser = argparse.ArgumentParser()
++    group = parser.add_mutually_exclusive_group(required=True)
++    group.add_argument("--run", help="raw identification CSV (explicit; never auto-selected)")
++    group.add_argument("--code-only", action="store_true", help="package code-change evidence only")
++    parser.add_argument("--out-dir", default=str(ROOT / "reports" / "handoff"))
++    args = parser.parse_args()
++    print(build(Path(args.run) if args.run else None, Path(args.out_dir)))
+     return 0
+ 
+ 

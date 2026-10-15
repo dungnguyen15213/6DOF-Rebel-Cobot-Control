@@ -175,3 +175,49 @@ When a run is stopped, the raw CSV and `.csv.json` sidecar are saved first; a ba
 ```
 
 New CSV column `status_frame_counter` counts STATUS frames only; `frame_counter` counts all frame types. The sidecar adds `logger_accounting`, `frame_accounting` (start/end per-type counters) and `live_derivative_policy` (live qdot/qddot are NaN when the receive interval is below 10 ms; heuristic, derived values are not ground truth).
+
+## Current channel semantics and freshness (added after RUN_03)
+
+Each row has `position_validity` and `current_validity`:
+
+| State | Meaning |
+|---|---|
+| FRESH | The channel was present in that STATUS frame and finite. A measured 0 is FRESH. |
+| MISSING | The channel was absent from that STATUS frame; values are NaN, never a carried-over value. |
+| NON_FINITE | The channel was present but NaN/inf. |
+| UNKNOWN | Legacy file with no validity columns; freshness cannot be verified. |
+
+Stale values cannot be logged as measurements: the parser resets the per-frame field set every STATUS and the GUI only copies `CURRENTJOINTS` when it is in that frame. Controller-side repetition of an old value can only be detected statistically, so a legacy file is reported as NOT VERIFIED, not PASS.
+
+Not known from software evidence (no CRI manual in this repo): sign of `CURRENTJOINTS` (all RUN_03 values are >= 0, so sign is unverified), signed vs magnitude, and that indexes 0-5 map to J1-J6. Units are assumed mA; confirm against the vendor documentation before model fitting.
+
+RUN_03 finding: only J1, J2, J3, J5 moved. J4 and J6 stayed at 0 deg (J4 current constant 18-19 mA, J6 current 0 mA). They were not excited; that does not prove a fault.
+
+## Lab procedures (operator-run, no new limits)
+
+All motion uses the already-approved trajectory/jog workflow and the usual safety setup. Nothing here is autonomous.
+
+- **Test A, stationary baseline (30-60 s):** robot enabled, not moving, identification recording on. Expect all validity FRESH, zero velocity, constant currents. Audit with `python tools\audit_identification_run.py <csv>`.
+- **Test B, J6 validation:** using an already-approved safe movement that includes J6, record q6 and current6 together with the other channels. Check that q6 changes and current6 responds, and compare against the neighbouring joints. Do not infer a J6 fault or fix from RUN_03.
+- **Test C, repeat trajectory:** repeat the same trajectory as RUN_03, then compare run-to-run.
+- **Acceptance:** audit verdict not NOT READY, `current_freshness` PASS, STATUS frame accounting PASS, every joint to be identified shows motion and current response, sign confirmed.
+
+Commands:
+
+```
+python -m core.run_report <csv>
+python tools\audit_identification_run.py <csv> --processed
+python tools\export_identification_handoff.py --run <csv>
+```
+
+Preprocessing rules: `reports/identification_fix/PREPROCESSING_POLICY.md`. Acceleration from host receive times is exploratory only.
+
+## Tests
+
+```
+pip install -r requirements.txt
+$env:QT_QPA_PLATFORM="offscreen"
+python -m unittest discover -s tests -p "test_*.py"
+```
+
+GUI tests need PyQt6, scipy and pyyaml.

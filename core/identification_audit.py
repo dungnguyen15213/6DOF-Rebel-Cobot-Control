@@ -19,6 +19,7 @@ from typing import Any, Iterator
 import numpy as np
 
 from core.identification_logger import (
+    MIN_DERIVATIVE_DT_S,
     CURRENT_VECTOR_COLUMNS,
     METADATA_COLUMNS,
     Q_VECTOR_COLUMNS,
@@ -393,10 +394,47 @@ def audit_run(
             break
         leading_zero += 1
     multi_zero = np.flatnonzero((current == 0.0).sum(axis=1) >= cfg.multi_zero_channels)
+    validity_present = "current_validity" in run["fieldnames"] and "position_validity" in run["fieldnames"]
+    validity_counts = {
+        channel: {
+            state: sum(str(row.get(f"{channel}_validity", "")).strip() == state for row in rows)
+            for state in ("FRESH", "MISSING", "NON_FINITE", "UNKNOWN")
+        }
+        for channel in ("position", "current")
+    }
+    if validity_present:
+        bad_validity = {
+            channel: counts for channel, counts in validity_counts.items()
+            if counts["MISSING"] or counts["NON_FINITE"]
+        }
+        unverified = any(
+            counts["FRESH"] != len(rows) and not (counts["MISSING"] or counts["NON_FINITE"])
+            for counts in validity_counts.values()
+        )
+        integrity.append(
+            _criterion(
+                "I8", "Explicit per-row freshness of position and current telemetry",
+                FAIL if bad_validity else NOT_VERIFIED if unverified else PASS,
+                {"counts": validity_counts,
+                 "rule": "FRESH = field present in the same STATUS and finite; a measured 0 is FRESH"},
+            )
+        )
+    else:
+        integrity.append(
+            _criterion(
+                "I8", "Explicit per-row freshness of position and current telemetry",
+                NOT_VERIFIED,
+                "legacy recording without position_validity/current_validity columns",
+            )
+        )
+    i5_status = FAIL if leading_zero else WARNING if all_zero.any() or multi_zero.size else PASS
+    if validity_present and validity_counts["current"]["FRESH"] == len(rows):
+        # Zeros are then genuine measurements (or controller-reported), not initialisation.
+        i5_status = PASS
     integrity.append(
         _criterion(
             "I5", "Current telemetry is fresh (no initialized or partially zeroed rows)",
-            FAIL if leading_zero else WARNING if all_zero.any() or multi_zero.size else PASS,
+            i5_status,
             {
                 "all_zero_rows": int(all_zero.sum()),
                 "leading_all_zero_rows": leading_zero,
@@ -566,6 +604,7 @@ def audit_run(
     else:
         dropped = sidecar_data.get("writer_dropped_sample_count", 0)
         writer_error = sidecar_data.get("writer_error")
+        integrity.append(_frame_accounting_criterion(sidecar_data, len(rows), rows))
         integrity.append(
             _criterion(
                 "L1", "Logger writer reported no drops or errors",
@@ -631,6 +670,37 @@ def audit_run(
         "10-15 trajectory recipes with independent repeats.",
     )
     return report
+
+
+def _frame_accounting_criterion(sidecar: dict[str, Any], row_count: int, rows: list[dict[str, str]]) -> dict[str, Any]:
+    """STATUS frames received during the recording must equal rows written (other types are not data loss)."""
+    name = "All received STATUS frames are accounted for"
+    counters = []
+    for row in rows:
+        try:
+            counters.append(int(row.get("status_frame_counter", "")))
+        except (TypeError, ValueError):
+            counters.append(-1)
+    contiguous = bool(counters) and all(c >= 0 for c in counters) and all(b - a == 1 for a, b in zip(counters, counters[1:]))
+    accounting = sidecar.get("frame_accounting") or {}
+    start, end = accounting.get("start"), accounting.get("end")
+    evidence: dict[str, Any] = {"status_counter_contiguous": contiguous, "rows": row_count}
+    if not start or not end or start.get("connection_epoch") != end.get("connection_epoch"):
+        return _criterion("L2", name, NOT_VERIFIED if not start or not end else FAIL,
+                          {**evidence, "reason": "start/end frame stats missing or the connection restarted during the run"})
+    received = end["status_frames"] - start["status_frames"]
+    evidence.update(
+        status_frames_received=received,
+        discarded_frames_delta=end.get("discarded_frames", 0) - start.get("discarded_frames", 0),
+        parse_errors_delta=end.get("parse_errors", 0) - start.get("parse_errors", 0),
+        callback_errors_delta=end.get("status_callback_errors", 0) - start.get("status_callback_errors", 0),
+        other_frame_types_ignored_here=True,
+    )
+    # +/-1: the stop snapshot can be taken just before/after the final callback.
+    ok = abs(received - row_count) <= 1 and contiguous
+    if evidence["parse_errors_delta"] or evidence["callback_errors_delta"] or evidence["discarded_frames_delta"]:
+        ok = False
+    return _criterion("L2", name, PASS if ok else FAIL, evidence)
 
 
 def _stats(values: np.ndarray) -> dict[str, float | None]:
@@ -706,10 +776,16 @@ PROCESSED_UNITS = {
 }
 
 
-def _gradient(values: np.ndarray, times: np.ndarray) -> np.ndarray:
+def _gradient(values: np.ndarray, times: np.ndarray, min_dt_s: float = 0.0) -> np.ndarray:
+    """Central difference; NaN (never 0) unless both neighbouring intervals are >= min_dt_s."""
     result = np.full(values.shape, np.nan)
     if values.size >= 3:
-        result[1:-1] = (values[2:] - values[:-2]) / (times[2:] - times[:-2])
+        back = times[1:-1] - times[:-2]
+        fwd = times[2:] - times[1:-1]
+        ok = (back >= max(min_dt_s, np.finfo(float).tiny)) & (fwd >= max(min_dt_s, np.finfo(float).tiny))
+        span = times[2:] - times[:-2]
+        diff = values[2:] - values[:-2]
+        result[1:-1] = np.where(ok, diff / np.where(ok, span, 1.0), np.nan)
     return result
 
 
@@ -717,6 +793,7 @@ def build_processed_dataset(
     csv_path: str | Path,
     output_path: str | Path,
     smoothing_window: int = 1,
+    min_dt_s: float = MIN_DERIVATIVE_DT_S,
 ) -> dict[str, Any]:
     """Write a derived CSV (SI units) and provenance JSON; the raw CSV is only read.
 
@@ -753,10 +830,10 @@ def build_processed_dataset(
         qk = q_rad[kept_indices, joint]
         if not np.isfinite(qk).all():
             continue
-        velocity = _gradient(qk, kept_t)
+        velocity = _gradient(qk, kept_t, min_dt_s)
         if smoothing_window > 1:
             velocity = _moving_average(velocity, smoothing_window)
-        acceleration = _gradient(np.where(np.isfinite(velocity), velocity, np.nan), kept_t)
+        acceleration = _gradient(np.where(np.isfinite(velocity), velocity, np.nan), kept_t, min_dt_s)
         qdot[kept_indices, joint] = velocity
         qddot[kept_indices, joint] = acceleration
 
@@ -764,6 +841,8 @@ def build_processed_dataset(
         "source_file", "source_row", "sample_index", "t_host_s", "t_s",
         *METADATA_COLUMNS, "batch_size", "batch_position", "flag_duplicate_timestamp",
         "flag_current_invalid", "flag_use_for_derivatives",
+        "status_frame_counter", "timing_class", "position_validity", "current_validity",
+        "flag_velocity_valid", "flag_acceleration_valid",
         *(f"q{j}_rad" for j in range(1, 7)),
         *(f"qdot{j}_rad_s" for j in range(1, 7)),
         *(f"qddot{j}_rad_s2" for j in range(1, 7)),
@@ -787,6 +866,12 @@ def build_processed_dataset(
                 "flag_duplicate_timestamp": int(batch["size"][index] > 1),
                 "flag_current_invalid": int(not np.isfinite(current_mA[index]).all()),
                 "flag_use_for_derivatives": int(increasing[index]),
+                "status_frame_counter": row.get("status_frame_counter", ""),
+                "timing_class": row.get("timing_class", ""),
+                "position_validity": row.get("position_validity", ""),
+                "current_validity": row.get("current_validity", ""),
+                "flag_velocity_valid": int(np.isfinite(qdot[index]).all()),
+                "flag_acceleration_valid": int(np.isfinite(qddot[index]).all()),
             }
             for joint in range(6):
                 out[f"q{joint + 1}_rad"] = repr(float(q_rad[index, joint]))
@@ -810,6 +895,18 @@ def build_processed_dataset(
         },
         "rows": len(rows),
         "derivative_rows": int(np.isfinite(qdot[:, 0]).sum()),
+        "parameters": {"min_dt_s": min_dt_s, "smoothing_window": smoothing_window,
+                       "representative_policy": "last row of each identical-timestamp batch"},
+        "exclusions": {
+            "rows_total": len(rows),
+            "not_batch_last_or_non_finite_time": int((~usable).sum()),
+            "representative_rows": int(usable.sum()),
+            "representative_rows_without_valid_velocity": int((usable & ~np.isfinite(qdot).all(axis=1)).sum()),
+            "representative_rows_without_valid_acceleration": int((usable & ~np.isfinite(qddot).all(axis=1)).sum()),
+        },
+        "limitations": "Times are host receive times, not sample times. Velocity is a candidate; acceleration is "
+        "exploratory and must not be treated as physical ground truth. Unavailable values are NaN, never 0. "
+        "Anomalies are not smoothed away unless smoothing_window>1 is requested and recorded here.",
         "run_id": sorted({row.get("run_id", "") for row in rows}),
         "model_features": {
             "A": "[1, qdot, tanh(qdot/v_s), sin(q), cos(q)]",

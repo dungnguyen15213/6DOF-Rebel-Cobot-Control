@@ -1,15 +1,1 @@
-{
-    "changed_files":  [
-                          "IDENTIFICATION_DATA_COLLECTION.md",
-                          "core/identification_logger.py",
-                          "core/run_report.py",
-                          "cri_lib/cri_controller.py",
-                          "cri_lib/frame_timing.py",
-                          "gui/main_window.py",
-                          "tests/test_run_report.py",
-                          "tools/export_identification_handoff.py"
-                      ],
-    "tests":  "see test_results.txt",
-    "generated":  "2026-10-15T13:54:24.2010595+07:00",
-    "raw_data_modified":  false
-}
+{"run":"identification_ID_NORMAL_003_trajectory_export_RUN_03_20261015T135600","tests":104,"verdict":"CONDITIONALLY READY"}

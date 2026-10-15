@@ -1,0 +1,45 @@
+{
+  "source_file": "D:\\01_VGU\\03_IHMS\\03_Project\\06_6DOFCobotController\\identification_data\\identification_ID_NORMAL_003_trajectory_export_RUN_03_20261015T135600.csv",
+  "source_sha256": "4235e1c94a7b34c2642377d1a5c6a01b0829ef0dabd6f9e347c8320dc8329a12",
+  "processed_file": "D:\\01_VGU\\03_IHMS\\03_Project\\06_6DOFCobotController\\reports\\identification_runs\\identification_ID_NORMAL_003_trajectory_export_RUN_03_20261015T135600\\processed_dataset.csv",
+  "units": {
+    "t_s": "s since first sample (host receive clock)",
+    "q*_rad": "rad",
+    "qdot*_rad_s": "rad/s",
+    "qddot*_rad_s2": "rad/s^2",
+    "current*_A": "A"
+  },
+  "raw_units": {
+    "q": "deg",
+    "current": "mA"
+  },
+  "method": {
+    "velocity": "central difference of q (rad) on the last row of each identical-timestamp batch, using measured timestamps",
+    "acceleration": "central difference of reconstructed velocity; boundary rows left NaN",
+    "smoothing_window_samples": 1,
+    "non_batch_last_rows": "derivatives NaN (true sample time unknown); raw values preserved",
+    "live_qddot": "ignored; not trusted as acceleration ground truth"
+  },
+  "rows": 632,
+  "derivative_rows": 372,
+  "parameters": {
+    "min_dt_s": 0.01,
+    "smoothing_window": 1,
+    "representative_policy": "last row of each identical-timestamp batch"
+  },
+  "exclusions": {
+    "rows_total": 632,
+    "not_batch_last_or_non_finite_time": 218,
+    "representative_rows": 414,
+    "representative_rows_without_valid_velocity": 42,
+    "representative_rows_without_valid_acceleration": 80
+  },
+  "limitations": "Times are host receive times, not sample times. Velocity is a candidate; acceleration is exploratory and must not be treated as physical ground truth. Unavailable values are NaN, never 0. Anomalies are not smoothed away unless smoothing_window>1 is requested and recorded here.",
+  "run_id": [
+    "RUN_03"
+  ],
+  "model_features": {
+    "A": "[1, qdot, tanh(qdot/v_s), sin(q), cos(q)]",
+    "B": "[1, qddot, qdot, tanh(qdot/v_s), sin(q), cos(q)]"
+  }
+}

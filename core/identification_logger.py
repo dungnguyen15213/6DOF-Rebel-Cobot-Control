@@ -41,6 +41,22 @@ TIMING_COLUMNS = [
     "status_frame_counter",
 ]
 
+# Per-row validity of the raw channels, from the STATUS message that produced the row.
+# FRESH: the field was present in this very STATUS and all six values are finite
+#   (a measured 0 is FRESH). MISSING: field absent from this STATUS (value logged as
+#   nan, the cached RobotState value is never reused). NON_FINITE: field present but
+#   a value did not parse to a finite number. UNKNOWN: caller gave no field info.
+VALIDITY_COLUMNS = ["position_validity", "current_validity"]
+VALIDITY_STATES = ("FRESH", "MISSING", "NON_FINITE", "UNKNOWN")
+
+
+def classify_channel(status_fields: Any, field: str, values: Iterable[float]) -> str:
+    if status_fields is None:
+        return "UNKNOWN"
+    if field not in status_fields:
+        return "MISSING"
+    return "FRESH" if all(math.isfinite(v) for v in values) else "NON_FINITE"
+
 # Live derivatives need receive intervals at least this long. Shorter intervals
 # are host-scheduling artefacts (RUN_02: 0.2 ms between reads), not sampling
 # intervals, and would turn quantisation steps into huge velocities. Heuristic,
@@ -56,6 +72,7 @@ IDENTIFICATION_COLUMNS = [
     *QDDOT_VECTOR_COLUMNS,
     *METADATA_COLUMNS,
     *TIMING_COLUMNS,
+    *VALIDITY_COLUMNS,
 ]
 
 USABLE_TIMING_CLASSES = {"", "UNKNOWN", "UNIQUE", "BATCH_LAST"}
@@ -194,6 +211,8 @@ class IdentificationLogger:
         self.row_count = 0
         self.dropped_sample_count = 0
         self.samples_offered = 0
+        self.position_validity_counts = {state: 0 for state in VALIDITY_STATES}
+        self.current_validity_counts = {state: 0 for state in VALIDITY_STATES}
         self.samples_q_complete = 0
         self.samples_current_complete = 0
         self.writer_error: str | None = None
@@ -233,18 +252,23 @@ class IdentificationLogger:
         qddot: Iterable[Any] | None = None,
         metadata: dict[str, Any] | None = None,
         frame_timing: Any = None,
+        status_fields: Any = None,
     ) -> None:
         del qdot, qddot, metadata  # Legacy arguments cannot alter frozen run data.
         timing_fields = _timing_fields(frame_timing)
         sample_timestamp = _coerce_float(timestamp, float("nan"))
         sample_q = tuple(_as_float_list(q, 6))
         sample_current = tuple(_as_float_list(current, 6))
+        timing_fields["position_validity"] = classify_channel(status_fields, "POSJOINTCURRENT", sample_q)
+        timing_fields["current_validity"] = classify_channel(status_fields, "CURRENTJOINTS", sample_current)
         with self._state_lock:
             if not self._accepting_samples:
                 return
             sample_index = self._next_sample_index
             self._next_sample_index += 1
             self.samples_offered += 1
+            self.position_validity_counts[timing_fields["position_validity"]] += 1
+            self.current_validity_counts[timing_fields["current_validity"]] += 1
             self.samples_q_complete += all(math.isfinite(v) for v in sample_q)
             self.samples_current_complete += all(math.isfinite(v) for v in sample_current)
             try:
@@ -394,6 +418,11 @@ class IdentificationLogger:
                     "dropped_by_queue_or_writer": self.dropped_sample_count,
                 },
                 "frame_accounting": frame_accounting,
+                "validity_accounting": {
+                    "position": dict(self.position_validity_counts),
+                    "current": dict(self.current_validity_counts),
+                    "note": "FRESH = field present in the same STATUS and finite (measured 0 is FRESH); MISSING/NON_FINITE rows are logged as nan, never as 0",
+                },
                 "live_derivative_policy": {
                     "min_dt_s": MIN_DERIVATIVE_DT_S,
                     "rule": "qdot/qddot are NaN (unavailable, not zero) for BATCH_EARLIER rows, dt < min_dt_s, or non-finite inputs; they are derived, never ground truth",

@@ -14,3 +14,6 @@ Evidence: `identification_data/..._RUN_02_20261015T133850.csv` (632 rows, unmodi
 | Writer drops | None (`sample_index` contiguous). | Confirmed |
 
 Nothing in the fix invents timestamps or adds epsilon offsets. Timestamp quality remains limited by host receive time.
+
+## RUN_03 update
+See phase1_run03_investigation.md. I4 was already in audit_run aggregation; the old run_report.decisions() ignored it (fixed). Freshness is now explicit per row; STATUS accounting verified (632 rows = 1985-1353).

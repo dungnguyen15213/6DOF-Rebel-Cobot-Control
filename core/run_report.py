@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from core.identification_audit import audit_run, format_report
+from core.identification_audit import audit_run, build_processed_dataset, format_report
 
 PASS, WARNING, FAIL, NV = "PASS", "WARNING", "FAIL", "NOT VERIFIED"
 RECEIVE_DT_CV_LIMIT = 0.25  # heuristic: receive-interval jitter acceptable for derivatives
@@ -98,45 +98,114 @@ def current_freshness(rows: list[dict[str, str]]) -> dict[str, Any]:
     return result
 
 
+def _crit(audit: dict[str, Any], cid: str) -> tuple[str, Any]:
+    for item in audit["criteria"]:
+        if item["id"] == cid:
+            return item["status"], item["evidence"]
+    return NV, "criterion not evaluated"
+
+
+def _worst(statuses: list[str]) -> str:
+    for level in (FAIL, WARNING, NV):
+        if level in statuses:
+            return level
+    return PASS
+
+
 def decisions(audit: dict[str, Any], timing: dict[str, Any], currents: dict[str, Any]) -> dict[str, Any]:
-    crit = {c["id"]: c for c in audit["criteria"]}
-    # A. raw telemetry integrity
-    a_fail = [k for k in ("R1", "R2", "R3", "I1", "I2", "I3") if k in crit and crit[k]["status"] == FAIL]
-    stuck = [j for j, s in currents.items() if s["finite"] and s["exact_zero"] == s["finite"]]
-    if a_fail:
-        a = (FAIL, f"criteria failed: {a_fail}")
-    elif stuck:
-        a = (WARNING, f"channels exactly zero on every row: {stuck}; may be an unmoved/unloaded joint or a missing field (hardware check needed)")
-    else:
-        a = (PASS, "structural checks pass")
-    # B. timestamp provenance
-    t2 = crit.get("T2", {}).get("status", NV)
-    b = (t2, "host receive time only; no device timestamp exists in CRI STATUS frames; batched rows share a timestamp")
-    if t2 == PASS:
-        b = (WARNING, b[1])
-    # C. Model A (offline, current vs. position-derived features)
+    """Independent decisions; the readiness verdict is derived from them only.
+
+    Genuine zero current and stationary joints are never failures by themselves.
+    Any missing/non-finite raw value, missing column, malformed row, invalid
+    metadata, lost data or writer error is a FAIL.
+    """
+    st = {c["id"]: c["status"] for c in audit["criteria"]}
+    i4_status, i4 = _crit(audit, "I4")
+    bad_cols = i4.get("bad_columns", {}) if isinstance(i4, dict) else {}
+    bad_q = [c for c in bad_cols if c.startswith("q")]
+    bad_i = [c for c in bad_cols if c.startswith("current")]
+    structural = [k for k in ("R1", "R2", "R3") if st.get(k) == FAIL]
+    meta = [k for k in ("I1", "I2", "I3") if st.get(k) == FAIL]
+    ts_issue = isinstance(i4, dict) and any(i4.get("timestamp_issues", {}).values())
+
+    d: dict[str, dict[str, Any]] = {}
+    d["structure_and_metadata"] = {
+        "status": FAIL if structural or meta else PASS,
+        "reason": f"failed: {structural + meta}" if structural or meta else "columns, rows and metadata valid",
+    }
+    d["raw_positions"] = {
+        "status": FAIL if bad_q or structural or ts_issue else PASS,
+        "reason": f"missing/non-finite: {bad_q}" if bad_q else "all q finite (a constant joint is not a failure)",
+    }
+    constant = st.get("I6") == WARNING
+    d["raw_current"] = {
+        "status": FAIL if bad_i or structural else WARNING if constant else PASS,
+        "reason": f"missing/non-finite: {bad_i}" if bad_i
+        else "constant/zero channels present (stationary or unverified; genuine zeros are not a failure)" if constant
+        else "all current finite and varying",
+    }
+    i8, i8e = _crit(audit, "I8")
+    d["current_freshness"] = {
+        "status": i8,
+        "reason": {PASS: "every row has FRESH current and position from its own STATUS message",
+                   FAIL: "rows with MISSING/NON_FINITE telemetry", NV: "no explicit freshness flags in this recording"}[i8],
+        "evidence": i8e,
+    }
+    l2, l2e = _crit(audit, "L2")
+    d["status_frame_accounting"] = {
+        "status": FAIL if st.get("T4") == FAIL or l2 == FAIL else l2 if l2 != PASS else PASS,
+        "reason": "STATUS frames received during the run equal rows written; other frame types are not data loss"
+        if l2 == PASS else "see L2 evidence",
+        "evidence": l2e,
+    }
+    d["logger_integrity"] = {
+        "status": FAIL if st.get("L1") == FAIL else st.get("L1", NV),
+        "reason": "writer drops or errors" if st.get("L1") == FAIL else "no writer drops or errors reported",
+    }
+    t2 = st.get("T2", NV)
+    d["receive_timing"] = {
+        "status": FAIL if st.get("T1") == FAIL or t2 == FAIL else WARNING,
+        "reason": "host receive time only; STATUS carries no device timestamp; batched rows share a timestamp (labelled, not repaired)",
+    }
     chunk = timing.get("chunk_dt_s")
     if chunk is None:
-        c_model = (NV, "no chunk timing")
+        vel = acc = (NV, "no chunk timing")
     else:
-        frac = chunk["fraction_below_min_dt"]
-        cv = chunk["cv"]
-        if cv is not None and cv > RECEIVE_DT_CV_LIMIT or frac > 0.05:
-            c_model = (FAIL, f"receive-interval CV={cv:.2f}, fraction<min dt={frac:.2f}: acceleration from receive times is unreliable (Model B)")
-        else:
-            c_model = (WARNING, "receive intervals acceptable but still not device-time; verify on hardware")
-    a_model = (WARNING if a[0] != FAIL else FAIL,
-               "Model A (position/velocity-light, one sample per unique timestamp) usable offline only if currents are valid; excitation not assessed here")
-    ready = FAIL if FAIL in (a[0], b[0]) else (WARNING if WARNING in (a[0], b[0], c_model[0]) else PASS)
-    verdict = {FAIL: "NOT READY", WARNING: "CONDITIONALLY READY", PASS: "READY FOR CONTROLLED 0 G DRY TEST"}[ready]
-    return {
-        "A_raw_telemetry_integrity": {"status": a[0], "reason": a[1]},
-        "B_timestamp_provenance": {"status": b[0], "reason": b[1]},
-        "C_model_A_offline": {"status": a_model[0], "reason": a_model[1]},
-        "C_model_B_live_derivatives": {"status": c_model[0], "reason": c_model[1]},
-        "overall_readiness": verdict,
+        frac, cv = chunk["fraction_below_min_dt"], chunk["cv"]
+        jitter = (cv is not None and cv > RECEIVE_DT_CV_LIMIT) or frac > 0.05
+        vel = (WARNING, "finite differences use host receive intervals >= 10 ms; velocity noise unquantified")
+        acc = (FAIL if jitter else WARNING,
+               f"receive-interval CV={cv:.2f}, fraction<min dt={frac:.2f}: " + (
+                   "acceleration from receive times is unreliable" if jitter else "needs hardware timing validation"))
+    d["derived_velocity"] = {"status": vel[0], "reason": vel[1]}
+    d["derived_acceleration"] = {"status": acc[0], "reason": acc[1]}
+    raw_ok = all(d[k]["status"] != FAIL for k in
+                 ("structure_and_metadata", "raw_positions", "raw_current", "status_frame_accounting", "logger_integrity"))
+    d["model_a_exploratory"] = {
+        "status": WARNING if raw_ok else FAIL,
+        "reason": "offline exploration only: position/velocity features on time-valid rows; not final training data"
+        if raw_ok else "raw telemetry failed",
     }
-
+    d["model_b"] = {
+        "status": FAIL if not raw_ok or acc[0] == FAIL else WARNING,
+        "reason": "acceleration regressor unreliable with this timing" if acc[0] == FAIL else "unverified",
+    }
+    exc = audit.get("excitation_summary", {})
+    d["excitation"] = {
+        "status": exc.get("status", NV),
+        "reason": f"excited joints {exc.get('excited_joints')}; not fully excited {exc.get('not_fully_excited_joints')}",
+    }
+    gate = [d[k]["status"] for k in ("structure_and_metadata", "raw_positions", "raw_current",
+                                      "current_freshness", "status_frame_accounting", "logger_integrity", "receive_timing")]
+    if FAIL in gate or audit.get("overall_status") == FAIL:
+        verdict = "NOT READY"
+    elif all(s == PASS for s in gate[:-1]) and gate[-1] == WARNING and d["current_freshness"]["status"] == PASS \
+            and d["raw_current"]["status"] == PASS:
+        verdict = "READY FOR CONTROLLED 0 G DRY TEST"
+    else:
+        verdict = "CONDITIONALLY READY"
+    d["overall_readiness"] = verdict
+    return d
 
 def _plots(rows: list[dict[str, str]], out_dir: Path) -> list[str]:
     try:
@@ -221,6 +290,13 @@ def generate_run_report(csv_path: str | Path, out_root: str | Path = REPORT_ROOT
             w.writerow([row.get(c, "") for c in cols])
 
     plots = _plots(rows, out_dir)
+    # Derived offline dataset, separate from the raw CSV; skipped when the audit failed.
+    processed = out_dir / "processed_dataset.csv"
+    if audit["overall_status"] != FAIL:
+        try:
+            build_processed_dataset(csv_path, processed)
+        except ValueError as exc:
+            plots.append(f"processed dataset skipped: {exc}")
     manifest = {
         "run_id": run_id, "source_file": str(csv_path), "source_sha256": report["source_sha256"],
         "files": sorted(p.name for p in out_dir.iterdir()), "plots": plots,
@@ -230,12 +306,17 @@ def generate_run_report(csv_path: str | Path, out_root: str | Path = REPORT_ROOT
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = sys.argv[1:] if argv is None else argv
-    if not args:
-        print("usage: python -m core.run_report <identification.csv>")
-        return 2
-    print(generate_run_report(args[0]))
-    return 0
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Write the post-run report for one identification CSV")
+    parser.add_argument("csv_path")
+    parser.add_argument("--out-root", default=str(REPORT_ROOT))
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    out = generate_run_report(args.csv_path, args.out_root)
+    verdict = json.loads((out / "RUN_AUDIT.json").read_text(encoding="utf-8"))["decisions"]["overall_readiness"]
+    print(out)
+    print(verdict)
+    return 1 if verdict == "NOT READY" else 0
 
 
 if __name__ == "__main__":

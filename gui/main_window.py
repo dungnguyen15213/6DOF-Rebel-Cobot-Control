@@ -1693,6 +1693,7 @@ class MainWindow(QMainWindow):
                 qdot=None,
                 current=currents,
                 frame_timing=frame_timing,
+                status_fields=fields_seen,
             )
 
     def move_to_start(self):
