@@ -1,0 +1,4 @@
+﻿# Implementation report
+Release 1 and 2 implemented: CSV import/export (byte-compatible), editable waypoint table with undo/redo, insert/delete/duplicate/reorder/copy/paste, six-joint editor with lock and live-pose copy, templates A/B/C/D/F plus Test B J4/J6 non-executable shells, static validator (ERROR/WARNING/INFO/NOT VERIFIED), recipe library with versioning/search/duplicate/rename/archive, 15-recipe campaign planner with coverage and traceability links, planned-vs-recorded range comparison, position preview, light/dark theme, Pathways integration button.
+Files: `trajectory_studio/*`, `gui/trajectory_studio_window.py`, `tests/test_trajectory_studio.py`, minimal addition to `gui/main_window.py` (button + two handlers; no motion code touched), docs and reports.
+Tests: see TEST_RESULTS.txt (125 tests OK: 104 existing + 21 new).

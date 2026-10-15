@@ -604,6 +604,10 @@ class MainWindow(QMainWindow):
         trajectory_layout.addWidget(self.cmb_trajectory_files, 0, 1, 1, 2)
         trajectory_layout.addWidget(self.btn_load_trajectory, 1, 1)
         trajectory_layout.addWidget(self.btn_browse_trajectory, 1, 2)
+        self.btn_trajectory_studio = QPushButton("Trajectory Studio...")
+        self.btn_trajectory_studio.setToolTip("Author, preview and validate trajectories (no robot motion)")
+        self.btn_trajectory_studio.clicked.connect(self.open_trajectory_studio)
+        trajectory_layout.addWidget(self.btn_trajectory_studio, 1, 0)
         trajectory_layout.addWidget(QLabel("Loaded:"), 2, 0)
         trajectory_layout.addWidget(self.lbl_loaded_trajectory, 2, 1, 1, 2)
         trajectory_layout.addWidget(self.lbl_loaded_waypoints, 3, 0, 1, 3)
@@ -862,6 +866,25 @@ class MainWindow(QMainWindow):
             return
 
         file_path = directory / selected
+        self.load_trajectory_file(file_path)
+
+    def open_trajectory_studio(self):
+        from gui.trajectory_studio_window import TrajectoryStudioWindow
+        if getattr(self, "trajectory_studio", None) is None:
+            def live_pose():
+                if not self.manager.robot.connected:
+                    return None
+                return list(self.manager.get_joint_angles_list())
+
+            self.trajectory_studio = TrajectoryStudioWindow(
+                self, pathways_dir=self._trajectory_directory(), robot_pose_provider=live_pose)
+            self.trajectory_studio.setWindowFlag(Qt.WindowType.Window, True)
+            self.trajectory_studio.loadRequested.connect(self._on_studio_load_requested)
+        self.trajectory_studio.show()
+        self.trajectory_studio.raise_()
+
+    def _on_studio_load_requested(self, file_path):
+        self._populate_trajectory_files()
         self.load_trajectory_file(file_path)
 
     def browse_trajectory_file(self):

@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "recipe_id": "EXAMPLE_single_joint_J1_ILLUSTRATIVE",
+  "recipe_version": 1,
+  "description": "",
+  "category": "Single-Joint Identification",
+  "kind": "single_joint",
+  "validation_status": "DRAFT",
+  "motion_mode": "EXECUTABLE",
+  "units": {
+    "joints": "deg",
+    "velocity": "controller-command percent (physical speed not verified)"
+  },
+  "velocity_percent": 10,
+  "waypoints": [
+    {
+      "phase": "PREPARATION",
+      "joints_deg": [
+        0.0,
+        -40.0,
+        100.0,
+        0.0,
+        70.0,
+        0.0
+      ],
+      "note": ""
+    },
+    {
+      "phase": "TASK",
+      "joints_deg": [
+        2.5,
+        -40.0,
+        100.0,
+        0.0,
+        70.0,
+        0.0
+      ],
+      "note": ""
+    },
+    {
+      "phase": "TASK",
+      "joints_deg": [
+        5.0,
+        -40.0,
+        100.0,
+        0.0,
+        70.0,
+        0.0
+      ],
+      "note": ""
+    },
+    {
+      "phase": "TASK",
+      "joints_deg": [
+        7.5,
+        -40.0,
+        100.0,
+        0.0,
+        70.0,
+        0.0
+      ],
+      "note": ""
+    },
+    {
+      "phase": "TASK",
+      "joints_deg": [
+        10.0,
+        -40.0,
+        100.0,
+        0.0,
+        70.0,
+        0.0
+      ],
+      "note": ""
+    },
+    {
+      "phase": "TASK",
+      "joints_deg": [
+        7.5,
+        -40.0,
+        100.0,
+        0.0,
+        70.0,
+        0.0
+      ],
+      "note": ""
+    },
+    {
+      "phase": "TASK",
+      "joints_deg": [
+        5.0,
+        -40.0,
+        100.0,
+        0.0,
+        70.0,
+        0.0
+      ],
+      "note": ""
+    },
+    {
+      "phase": "TASK",
+      "joints_deg": [
+        2.5,
+        -40.0,
+        100.0,
+        0.0,
+        70.0,
+        0.0
+      ],
+      "note": ""
+    },
+    {
+      "phase": "TASK",
+      "joints_deg": [
+        0.0,
+        -40.0,
+        100.0,
+        0.0,
+        70.0,
+        0.0
+      ],
+      "note": ""
+    }
+  ],
+  "joint_limits_deg": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "limits_source": "none declared (repository has no authoritative joint limits)",
+  "locked_joints": [
+    false,
+    true,
+    true,
+    true,
+    true,
+    true
+  ],
+  "generation": {
+    "template": "single_joint_sweep",
+    "joint": 1,
+    "start_pose": [
+      0.0,
+      -40.0,
+      100.0,
+      0.0,
+      70.0,
+      0.0
+    ],
+    "target_deg": 10.0,
+    "segments_per_leg": 4,
+    "return_to_start": true,
+    "interpolation": "linear joint-space (authoring)"
+  },
+  "experiment": {},
+  "approval": {
+    "approved": false,
+    "by": "",
+    "date": ""
+  },
+  "exported_csv_sha256": "",
+  "software_revision": "",
+  "related_run_ids": []
+}

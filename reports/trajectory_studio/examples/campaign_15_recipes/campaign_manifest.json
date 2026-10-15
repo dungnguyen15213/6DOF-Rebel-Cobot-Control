@@ -1,0 +1,377 @@
+{
+  "schema_version": 1,
+  "experiment_id": "ID_NORMAL_001",
+  "name": "identification_campaign",
+  "generated_utc": "2026-10-15T07:51:16.538757+00:00",
+  "note": "Research-design plan, not a set of safety-certified movements. Planned values only.",
+  "recipes": [
+    {
+      "trajectory_id": "T01",
+      "recipe_id": "T01_J1_BIDIR_LOW",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T01_R01",
+        "ID_NORMAL_001_T01_R02"
+      ],
+      "speed_label": "low",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        1
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T02",
+      "recipe_id": "T02_J2_BIDIR_LOW",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T02_R01",
+        "ID_NORMAL_001_T02_R02"
+      ],
+      "speed_label": "low",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        2
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T03",
+      "recipe_id": "T03_J3_BIDIR_LOW",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T03_R01",
+        "ID_NORMAL_001_T03_R02"
+      ],
+      "speed_label": "low",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        3
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T04",
+      "recipe_id": "T04_J4_BIDIR_LOW",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T04_R01",
+        "ID_NORMAL_001_T04_R02"
+      ],
+      "speed_label": "low",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        4
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T05",
+      "recipe_id": "T05_J5_BIDIR_LOW",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T05_R01",
+        "ID_NORMAL_001_T05_R02"
+      ],
+      "speed_label": "low",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        5
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T06",
+      "recipe_id": "T06_J6_BIDIR_LOW",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T06_R01",
+        "ID_NORMAL_001_T06_R02"
+      ],
+      "speed_label": "low",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        6
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T07",
+      "recipe_id": "T07_J1_BIDIR_MEDIUM",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T07_R01",
+        "ID_NORMAL_001_T07_R02"
+      ],
+      "speed_label": "medium",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        1
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T08",
+      "recipe_id": "T08_J2_BIDIR_MEDIUM",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T08_R01",
+        "ID_NORMAL_001_T08_R02"
+      ],
+      "speed_label": "medium",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        2
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T09",
+      "recipe_id": "T09_J3_BIDIR_MEDIUM",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T09_R01",
+        "ID_NORMAL_001_T09_R02"
+      ],
+      "speed_label": "medium",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        3
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T10",
+      "recipe_id": "T10_J4_BIDIR_MEDIUM",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T10_R01",
+        "ID_NORMAL_001_T10_R02"
+      ],
+      "speed_label": "medium",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        4
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T11",
+      "recipe_id": "T11_J5_BIDIR_MEDIUM",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T11_R01",
+        "ID_NORMAL_001_T11_R02"
+      ],
+      "speed_label": "medium",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        5
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T12",
+      "recipe_id": "T12_J6_BIDIR_MEDIUM",
+      "kind": "test_b_template",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T12_R01",
+        "ID_NORMAL_001_T12_R02"
+      ],
+      "speed_label": "medium",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        6
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T13",
+      "recipe_id": "T13_COORD_J2J3",
+      "kind": "coordinated",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T13_R01",
+        "ID_NORMAL_001_T13_R02"
+      ],
+      "speed_label": "",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        2,
+        3
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T14",
+      "recipe_id": "T14_COORD_J4J5J6",
+      "kind": "coordinated",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T14_R01",
+        "ID_NORMAL_001_T14_R02"
+      ],
+      "speed_label": "",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        4,
+        5,
+        6
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    },
+    {
+      "trajectory_id": "T15",
+      "recipe_id": "T15_COORD_J1J2J3J4J5J6",
+      "kind": "coordinated",
+      "recipe_version": 1,
+      "planned_runs": 2,
+      "run_ids": [
+        "ID_NORMAL_001_T15_R01",
+        "ID_NORMAL_001_T15_R02"
+      ],
+      "speed_label": "",
+      "commanded_speed_percent": null,
+      "payload_g": 0.0,
+      "contact_label": "NORMAL",
+      "grasp_context": "NONE",
+      "thermal_condition": "COLD",
+      "role": "UNASSIGNED",
+      "planned_moving_joints": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ],
+      "waypoints_defined": 0,
+      "requires_operator_completion": true,
+      "operator_approved": false
+    }
+  ]
+}

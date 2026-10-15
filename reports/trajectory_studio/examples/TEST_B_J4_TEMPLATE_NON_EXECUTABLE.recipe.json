@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "recipe_id": "TEST_B_J3_BIDIRECTIONAL",
+  "recipe_version": 1,
+  "description": "Operator must supply start pose, +/- displacement and speed. Moves J3 only; purpose: observe J3 current response under controlled motion, not final identification.",
+  "category": "Joint Validation",
+  "kind": "test_b_template",
+  "validation_status": "DRAFT",
+  "motion_mode": "EXECUTABLE",
+  "units": {
+    "joints": "deg",
+    "velocity": "controller-command percent (physical speed not verified)"
+  },
+  "velocity_percent": null,
+  "waypoints": [],
+  "joint_limits_deg": [
+    null,
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "limits_source": "none declared (repository has no authoritative joint limits)",
+  "locked_joints": [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false
+  ],
+  "generation": {
+    "template": "bidirectional",
+    "joint": 3,
+    "start_pose": null,
+    "positive_deg": null,
+    "negative_deg": null,
+    "segments_per_leg": 4,
+    "cycles": 1,
+    "requires_operator_completion": true
+  },
+  "experiment": {},
+  "approval": {
+    "approved": false,
+    "by": "",
+    "date": ""
+  },
+  "exported_csv_sha256": "",
+  "software_revision": "",
+  "related_run_ids": []
+}
