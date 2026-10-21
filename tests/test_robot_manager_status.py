@@ -32,7 +32,7 @@ class RebelManagerStatusTest(unittest.TestCase):
         ]
         manager.robot.robot_state.status_fields_seen = {"CURRENTALL", "CURRENTJOINTS"}
 
-        self.assertAlmostEqual(manager.get_total_current(), 3.456)
+        self.assertAlmostEqual(manager.get_total_current(), 2.1)
         self.assertEqual(manager.get_joint_currents_list(), [0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
 
     def test_unavailable_current_is_nan_not_zero_or_cached_value(self) -> None:

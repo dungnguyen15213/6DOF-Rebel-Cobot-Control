@@ -688,8 +688,10 @@ class CRIController:
             self._register_answer("EXECEND")
 
         msg_id = self._send_command(command, True)
+        self.last_move_error = ""
         if (error_msg := self._wait_for_answer(msg_id, timeout=30.0)) is not None:
             logger.debug("Error in Move Joints command: %s", error_msg)
+            self.last_move_error = f"Command rejected: {error_msg}"
             return False
 
         if wait_move_finished:
@@ -699,6 +701,7 @@ class CRIController:
                 )
             ) is not None:
                 logger.debug("Exec Error in Move Joints command: %s", error_msg)
+                self.last_move_error = f"Move aborted: {error_msg}"
                 return False
         return True
 

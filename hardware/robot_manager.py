@@ -1,4 +1,4 @@
-import time
+﻿import time
 from cri_lib.cri_controller import CRIController
 from cri_lib.cri_errors import CRICommandTimeOutError
 
@@ -7,7 +7,13 @@ class RebelManager:
     """Handles all communication with the physical Igus ReBeL robot via CRI."""
 
     DEFAULT_SUPPLY_VOLTAGE_MV = 24000
-    PATH_COMMAND_INTERVAL_SEC = 1.0 / 30.0
+    WAYPOINT_TOLERANCE_DEG = 1.0
+    # The next waypoint is sent once the robot is this close to the current one, so the
+    # controller never decelerates to a stop between points.
+    WAYPOINT_BLEND_DEG = 2.0
+    PATH_ACCELERATION_PERCENT = 100.0
+    WAYPOINT_REACH_TIMEOUT_SEC = 20.0
+    WAYPOINT_POLL_SEC = 0.01
 
     def __init__(self):
         self.robot = CRIController()
@@ -70,20 +76,20 @@ class RebelManager:
         return [float(current) for current in currents]
 
     def get_total_current(self):
-        """Returns the total current draw reported by the robot STATUS stream in milliamps.
+        """Returns the sum of the six joint currents in milliamps.
 
-        If CURRENTALL is not provided by the robot, fall back to summing individual
-        CURRENTJOINTS values.
+        The robot's CURRENTALL field can stay at zero while joints draw current,
+        so it is only used when CURRENTJOINTS is not available.
         """
         with self.robot.robot_state_lock:
             state = self.robot.robot_state
             fields_seen = set(state.status_fields_seen)
             total = float(state.current_total)
-            joint_currents = list(state.current_joints)
-        if "CURRENTALL" in fields_seen:
-            return total
+            joint_currents = list(state.current_joints[:6])
         if "CURRENTJOINTS" in fields_seen and joint_currents:
             return float(sum(joint_currents))
+        if "CURRENTALL" in fields_seen:
+            return total
         return float("nan")
 
     def has_supply_voltage(self):
@@ -152,13 +158,37 @@ class RebelManager:
         if self.robot.connected and any(v != 0.0 for v in self.current_jog_speeds.values()):
             self.robot.set_jog_values(**self.current_jog_speeds)
 
-    def execute_path(self, path_data, velocity, stop_event=None):
-        """Dispatch ordered targets at 30 Hz and wait for final CRI completion.
+    def _joints_near(self, target, tolerance_deg):
+        """True when measured joints are within tolerance of target; None if feedback is unavailable."""
+        try:
+            measured = [float(value) for value in self.get_joint_angles_list()]
+            return max(abs(m - float(t)) for m, t in zip(measured, target[:6])) <= tolerance_deg
+        except (TypeError, ValueError):
+            return None
 
-        This matches the established execution behavior: intermediate point
-        targets are paced over CRI rather than sent as a TCP burst, while CRI
-        remains responsible for all motion profiling. The final ``EXECEND``
-        confirms physical completion before the UI reports success.
+    def _wait_until_near(self, target, stop_event, tolerance_deg=None):
+        """Block until the robot is within tolerance of a waypoint, so the next move does not replace it early."""
+        tolerance_deg = self.WAYPOINT_BLEND_DEG if tolerance_deg is None else tolerance_deg
+        deadline = time.monotonic() + self.WAYPOINT_REACH_TIMEOUT_SEC
+        while True:
+            near = self._joints_near(target, tolerance_deg)
+            if near is None or near:
+                return None
+            if stop_event is not None and stop_event.is_set():
+                return "Execution stopped by user."
+            if not self.robot.connected:
+                return "Robot disconnected during execution!"
+            if time.monotonic() > deadline:
+                return "Robot did not reach the waypoint in time."
+            time.sleep(self.WAYPOINT_POLL_SEC)
+
+    def execute_path(self, path_data, velocity, stop_event=None):
+        """Send ordered targets one at a time, advancing as the robot reaches each waypoint.
+
+        A new CRI ``Move Joint`` replaces the move in progress, so streaming all points at a fixed
+        rate makes the robot skip straight to the last one. Each waypoint is therefore sent only
+        once the previous one has been reached (within ``WAYPOINT_TOLERANCE_DEG``); CRI keeps
+        profiling each move, and the final ``EXECEND`` confirms physical completion.
         """
         if not path_data:
             return False, "Empty path"
@@ -166,8 +196,8 @@ class RebelManager:
             return False, "Robot not connected"
 
         error_message = None
-        start_time = time.monotonic()
         final_waypoint_index = len(path_data) - 1
+        accel = self.PATH_ACCELERATION_PERCENT
         for idx, angles in enumerate(path_data):
             if stop_event is not None and stop_event.is_set():
                 error_message = "Execution stopped by user."
@@ -176,13 +206,8 @@ class RebelManager:
                 error_message = "Robot disconnected during execution!"
                 break
 
-            dispatch_time = start_time + idx * self.PATH_COMMAND_INTERVAL_SEC
-            remaining = dispatch_time - time.monotonic()
-            if remaining > 0:
-                time.sleep(remaining)
-
             try:
-                success = self.robot.move_joints(
+                move_args = dict(
                     A1=angles[0], A2=angles[1], A3=angles[2],
                     A4=angles[3], A5=angles[4], A6=angles[5],
                     E1=0.0, E2=0.0, E3=0.0,
@@ -190,6 +215,11 @@ class RebelManager:
                     wait_move_finished=idx == final_waypoint_index,
                     move_finished_timeout=60.0,
                 )
+                success = self.robot.move_joints(acceleration=accel, **move_args)
+                if not success and idx == 0 and accel is not None:
+                    # Older controller firmware rejects the acceleration argument.
+                    accel = None
+                    success = self.robot.move_joints(**move_args)
             except CRICommandTimeOutError:
                 error_message = f"Timed out sending waypoint {idx}."
                 break
@@ -197,7 +227,13 @@ class RebelManager:
                 error_message = f"Error sending waypoint {idx}: {e}"
                 break
             if not success:
-                error_message = f"Failed to execute waypoint {idx}."
+                detail = getattr(self.robot, "last_move_error", "")
+                error_message = f"Failed to execute waypoint {idx}." + (f" {detail}" if isinstance(detail, str) and detail else "")
                 break
+            if idx != final_waypoint_index:
+                error_message = self._wait_until_near(angles, stop_event)
+                if error_message:
+                    error_message = f"Waypoint {idx}: {error_message}"
+                    break
 
         return error_message is None, error_message

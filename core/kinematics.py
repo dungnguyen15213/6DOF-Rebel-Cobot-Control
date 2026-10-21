@@ -1,6 +1,16 @@
 import numpy as np
 from scipy.optimize import minimize
 
+# The robot controller aborts moves beyond +/-95 deg on A5; plan with a small margin.
+J5_CONTROLLER_LIMIT_DEG = 95.0
+J5_PLAN_LIMIT_DEG = 93.0
+# Joint range (deg) a pathway may use: J2 matches the solver bounds, J5 the controller limit.
+J3_CONTROLLER_LIMIT_DEG = 140.0  # the diagnostics showed A3 stopping at exactly 140.00
+J3_PLAN_LIMIT_DEG = 138.0
+JOINT_LIMITS_DEG = [(-180.0, 180.0), (-120.0, 120.0), (-J3_CONTROLLER_LIMIT_DEG, J3_CONTROLLER_LIMIT_DEG),
+                    (-180.0, 180.0), (-J5_CONTROLLER_LIMIT_DEG, J5_CONTROLLER_LIMIT_DEG),
+                    (-180.0, 180.0)]
+
 class ReBelKinematics:
     def __init__(self):
         # ---------------------------------------------------------
@@ -93,10 +103,12 @@ class ReBelKinematics:
 
     # --- INVERSE KINEMATICS (IK) ---
     def inverse_kinematics(self, target_xyz, initial_guess_angles=None,
-                           locked_joints=None, target_rotation=None):
+                           locked_joints=None, target_rotation=None, level_tool=False):
         """
         Calculates the 6 joint angles required to reach a specific (X, Y, Z) target in mm.
         Uses a multi-seed approach to prevent getting trapped in local minimums.
+        ``level_tool`` keeps the tool plane parallel to the floor (tool axis pointing
+        straight down) while leaving the rotation about that axis free.
         Returns a list of angles in degrees on success, or None if physically unreachable.
         """
         target_xyz = np.array(target_xyz, dtype=float)
@@ -112,17 +124,24 @@ class ReBelKinematics:
             return None
 
         # The objective function to minimize (Euclidean Distance to target)
+        def level_error_rad(rotation):
+            return float(np.arccos(np.clip(-rotation[2, 2], -1.0, 1.0)))
+
         def objective_function(angles):
             current_tip = self.get_tip_position(angles)
             position_error = np.linalg.norm(current_tip - target_xyz)
-            if target_rotation is None:
+            if target_rotation is None and not level_tool:
                 return position_error
 
-            current_rotation = self.get_tip_transform(angles)[:3, :3]
-            rotation_delta = target_rotation.T @ current_rotation
-            rotation_cos = np.clip((np.trace(rotation_delta) - 1.0) / 2.0, -1.0, 1.0)
-            orientation_error_rad = np.arccos(rotation_cos)
-            return position_error + 100.0 * orientation_error_rad
+            transform = self.get_tip_transform(angles)
+            total = position_error
+            if level_tool:
+                total += 100.0 * level_error_rad(transform[:3, :3])
+            if target_rotation is not None:
+                rotation_delta = target_rotation.T @ transform[:3, :3]
+                rotation_cos = np.clip((np.trace(rotation_delta) - 1.0) / 2.0, -1.0, 1.0)
+                total += 100.0 * np.arccos(rotation_cos)
+            return total
 
         # REVISED BOUNDS: 
         # J2 (Shoulder) and J5 (Wrist) loosened to ~120 degrees (+/- 2.1 radians)
@@ -130,9 +149,9 @@ class ReBelKinematics:
         bounds = [
             (-np.pi, np.pi),       # J1: Base spin
             (-2.1, 2.1),           # J2: Shoulder pitch
-            (-np.pi, np.pi),       # J3: Elbow pitch
+            (-np.radians(J3_PLAN_LIMIT_DEG), np.radians(J3_PLAN_LIMIT_DEG)),  # J3: Elbow pitch
             (-np.pi, np.pi),       # J4: Forearm twist
-            (-2.1, 2.1),           # J5: Wrist pitch
+            (-np.radians(J5_PLAN_LIMIT_DEG), np.radians(J5_PLAN_LIMIT_DEG)),  # J5: Wrist pitch (controller limit is 95 deg)
             (-np.pi, np.pi)        # J6: Flange twist
         ]
         for joint_index, angle_degrees in locked_joints.items():
@@ -160,6 +179,9 @@ class ReBelKinematics:
         
         # Seed 5: Straight Up in the air
         seeds.append(np.array([j1_target, 0.0, 0.0, 0.0, 0.0, 0.0]))
+
+        # Seed 6: Tool pointing down, the usual working posture within the J5 limit
+        seeds.append(np.array([j1_target, np.radians(-15.0), np.radians(120.0), 0.0, np.radians(70.0), 0.0]))
 
         best_result = None
         best_distance = float('inf')
@@ -191,6 +213,9 @@ class ReBelKinematics:
             rotation_delta = target_rotation.T @ current_rotation
             orientation_cos = np.clip((np.trace(rotation_delta) - 1.0) / 2.0, -1.0, 1.0)
             orientation_error = float(np.degrees(np.arccos(orientation_cos)))
+        if best_angles is not None and level_tool:
+            level_error = float(np.degrees(level_error_rad(self.get_tip_transform(best_angles)[:3, :3])))
+            orientation_error = max(orientation_error, level_error)
 
         if position_error > 1.0 or orientation_error > 1.0:
             constraints = []
@@ -198,12 +223,14 @@ class ReBelKinematics:
                 constraints.append("locked joints")
             if target_rotation is not None:
                 constraints.append("fixed tool orientation")
+            if level_tool:
+                constraints.append("level tool plane")
             constraint_text = f" with {', '.join(constraints)}" if constraints else ""
             self.last_ik_error = (
                 f"No IK solution{constraint_text}: closest position error was "
                 f"{position_error:.2f} mm"
             )
-            if target_rotation is not None:
+            if target_rotation is not None or level_tool:
                 self.last_ik_error += f" and orientation error was {orientation_error:.2f}°."
             else:
                 self.last_ik_error += "."

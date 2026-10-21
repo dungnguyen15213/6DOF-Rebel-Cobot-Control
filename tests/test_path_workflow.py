@@ -1,4 +1,4 @@
-import tempfile
+﻿import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
@@ -27,7 +27,7 @@ class PathWorkflowTests(unittest.TestCase):
         self.assertIn("CMD Move Joint", output)
         self.assertNotIn("Time", output)
 
-    def test_robot_manager_paces_waypoints_and_waits_for_final_completion(self):
+    def test_robot_manager_waits_for_each_waypoint_and_final_completion(self):
         manager = RebelManager()
         manager.robot = Mock(connected=True)
         manager.robot.move_joints.return_value = True
@@ -44,6 +44,41 @@ class PathWorkflowTests(unittest.TestCase):
             [False, True],
         )
         self.assertTrue(all(call.kwargs["move_finished_timeout"] == 60.0 for call in manager.robot.move_joints.call_args_list))
+
+    def test_each_waypoint_is_reached_before_the_next_is_sent(self):
+        manager = RebelManager()
+        manager.WAYPOINT_POLL_SEC = 0.0
+        manager.robot = Mock(connected=True)
+        position = [0.0] * 6
+        sent = []
+
+        def move_joints(**kwargs):
+            # Record where the robot was when this command arrived, then let it reach the target.
+            sent.append((list(position), kwargs["A1"]))
+            position[0] = kwargs["A1"]
+            return True
+
+        manager.robot.move_joints.side_effect = move_joints
+        manager.get_joint_angles_list = lambda: list(position)
+
+        success, error = manager.execute_path([[a, 0, 0, 0, 0, 0] for a in (5.0, 10.0, 15.0)], 50.0)
+
+        self.assertTrue(success, error)
+        self.assertEqual([before[0] for before, _ in sent], [0.0, 5.0, 10.0])
+
+    def test_stalled_robot_reports_unreached_waypoint(self):
+        manager = RebelManager()
+        manager.WAYPOINT_POLL_SEC = 0.0
+        manager.WAYPOINT_REACH_TIMEOUT_SEC = 0.05
+        manager.robot = Mock(connected=True)
+        manager.robot.move_joints.return_value = True
+        manager.get_joint_angles_list = lambda: [0.0] * 6
+
+        success, error = manager.execute_path([[10.0] * 6, [20.0] * 6], 50.0)
+
+        self.assertFalse(success)
+        self.assertIn("Waypoint 0", error)
+        self.assertEqual(manager.robot.move_joints.call_count, 1)
 
     def test_path_execution_has_no_final_position_tolerance_poll(self):
         self.assertFalse(hasattr(RebelManager, "_wait_for_position"))

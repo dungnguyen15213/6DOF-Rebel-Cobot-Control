@@ -35,3 +35,11 @@ class PathPlanner:
             previous_angles = angles
 
         return path
+
+    @staticmethod
+    def join_segments(segments):
+        """Chain segments into one path; each later segment's first waypoint repeats the previous end."""
+        joined = []
+        for segment in segments:
+            joined.extend(segment if not joined else segment[1:])
+        return joined

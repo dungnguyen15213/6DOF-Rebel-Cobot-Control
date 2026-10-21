@@ -8,16 +8,18 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGr
                              QGroupBox, QLabel, QPushButton, QLineEdit, QMessageBox,
                              QComboBox, QDoubleSpinBox, QDialog, QSpinBox, QFileDialog, QSlider, QScrollArea, QTabWidget, QCheckBox,
                              QFormLayout, QDialogButtonBox)
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtWidgets import QSplitter
+from PyQt6.QtCore import Qt, QTimer, QEvent
+from PyQt6.QtWidgets import QSplitter, QApplication, QAbstractSpinBox
 import numpy as np
 import csv
 
 from core.path_planner import PathPlanner
+from core.sequence_planner import SequenceError, SequencePlanner
+from gui.sequence_builder_widget import SequenceBuilderWidget
 from core.path_executor import PathExecutor
 from gui.stick_viewer import StickViewer
 from gui.analytics_panel import AnalyticsPanel, AlgorithmTuningPanel, LatencyDiagnosticsPanel
-from core.kinematics import ReBelKinematics
+from core.kinematics import ReBelKinematics, JOINT_LIMITS_DEG
 from core.digital_twin_analytics import (
     AdaptiveBaselineRLS, CUSUMDetector, PayloadEstimator, TelemetryLogger, TelemetryRecord,
 )
@@ -140,6 +142,34 @@ class IdentificationSettingsDialog(QDialog):
         }
 
 
+class TitleCornerGroupBox(QGroupBox):
+    """Group box that keeps a widget on its title line, right-aligned."""
+
+    def __init__(self, title: str, parent=None) -> None:
+        super().__init__(title, parent)
+        self._title_widget = None
+
+    def set_title_widget(self, widget: QWidget) -> None:
+        self._title_widget = widget
+        widget.setParent(self)
+        widget.show()
+        self._place_title_widget()
+
+    def _place_title_widget(self) -> None:
+        widget = self._title_widget
+        if widget is None:
+            return
+        widget.adjustSize()
+        x = self.width() - widget.width() - 10
+        y = max(0, (self.fontMetrics().height() - widget.height()) // 2)
+        widget.move(max(0, x), y)
+        widget.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place_title_widget()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -162,6 +192,7 @@ class MainWindow(QMainWindow):
         self.resize(1300, 850)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.pressed_keys = set()
+        QApplication.instance().installEventFilter(self)
         
         self.manager = RebelManager()
         self.kinematics = ReBelKinematics()
@@ -311,70 +342,102 @@ class MainWindow(QMainWindow):
         left_tabs = QTabWidget()
         left_tabs.setMaximumWidth(360)
 
-        connection_tab = QWidget()
-        connection_layout = QVBoxLayout(connection_tab)
-        connection_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        connection_layout.setContentsMargins(6, 6, 6, 6)
-        connection_layout.setSpacing(10)
-
-        # Connection Group
-        flow_group = QGroupBox("Connection")
+        # Connection Group (lives in the ROBOT STATUS panel)
+        flow_group = QGroupBox()
         flow_layout = QVBoxLayout()
-        flow_layout.setSpacing(6)
+        flow_layout.setContentsMargins(6, 6, 6, 6)
+        flow_layout.setSpacing(4)
         
         self.status_label = QLabel("Status: Disconnected ❌")
-        self.status_label.setStyleSheet("font-weight: bold; color: red; font-size: 14px;")
+        self.status_label.setStyleSheet("font-weight: bold; color: red; font-size: 12px;")
         self.lbl_execution = QLabel("Execution: Idle")
         self.lbl_execution.setStyleSheet("font-weight: bold; color: #cfd6dd;")
         self.ip_input = QLineEdit("192.168.3.11")
         
-        # Connect / Disconnect Row
-        conn_layout = QHBoxLayout()
-        conn_layout.setSpacing(4)
         self.btn_connect = QPushButton("Connect"); self.btn_connect.clicked.connect(self.connect_robot)
         self.btn_disconnect = QPushButton("Disconnect"); self.btn_disconnect.clicked.connect(self.disconnect_robot)
-        conn_layout.addWidget(self.btn_connect)
-        conn_layout.addWidget(self.btn_disconnect)
-
-        # Enable / Reset Row
-        en_res_layout = QHBoxLayout()
-        en_res_layout.setSpacing(4)
-        self.btn_enable = QPushButton("Enable"); self.btn_enable.clicked.connect(self.manager.enable_motors)
-        self.btn_reset = QPushButton("Reset"); self.btn_reset.clicked.connect(self.manager.reset_errors)
-        en_res_layout.addWidget(self.btn_enable)
-        en_res_layout.addWidget(self.btn_reset)
-        
-        # Home / Config Row
-        home_layout = QHBoxLayout()
-        home_layout.setSpacing(4)
-        self.btn_home = QPushButton("Home")
+        self.btn_home = QPushButton("🏠")
+        self.btn_home.setToolTip("Home")
         self.btn_home.setStyleSheet("background-color: #2980b9; color: white; font-weight: bold;")
         self.btn_home.clicked.connect(self.execute_homing)
-        
+        self.btn_enable = QPushButton("Enable"); self.btn_enable.clicked.connect(self.manager.enable_motors)
+        self.btn_reset = QPushButton("Reset"); self.btn_reset.clicked.connect(self.manager.reset_errors)
         self.btn_config_home = QPushButton("⚙️")
+        self.btn_config_home.setToolTip("Homing configuration")
         self.btn_config_home.clicked.connect(self.open_config_dialog)
-        
-        home_layout.addWidget(self.btn_home, stretch=4)
-        home_layout.addWidget(self.btn_config_home, stretch=1)
+
+        button_grid = QGridLayout()
+        button_grid.setHorizontalSpacing(4)
+        button_grid.setVerticalSpacing(4)
+        for index, btn in enumerate([self.btn_connect, self.btn_disconnect, self.btn_home,
+                                     self.btn_enable, self.btn_reset, self.btn_config_home]):
+            button_grid.addWidget(btn, index // 3, index % 3)
+        button_grid.setColumnStretch(0, 3)
+        button_grid.setColumnStretch(1, 3)
+        button_grid.setColumnStretch(2, 1)
+        self.btn_home.setMinimumWidth(40)
+        self.btn_config_home.setMinimumWidth(40)
 
         for btn in [self.btn_disconnect, self.btn_reset, self.btn_enable, self.btn_home]:
             btn.setEnabled(False)
 
-        flow_layout.addWidget(self.status_label)
-        flow_layout.addWidget(self.lbl_execution)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_label)
+        status_row.addWidget(self.lbl_execution)
+        flow_layout.addLayout(status_row)
         flow_layout.addWidget(self.ip_input)
-        flow_layout.addLayout(conn_layout)
-        flow_layout.addLayout(en_res_layout)
-        flow_layout.addLayout(home_layout)
+        flow_layout.addLayout(button_grid)
         flow_group.setLayout(flow_layout)
-        connection_layout.addWidget(flow_group)
-        connection_layout.addStretch()
 
         # 2. Jogging Group 
-        jog_group = QGroupBox("Jog Control (Hold I)")
+        jog_group = TitleCornerGroupBox("Jog Control (Hold I)")
         jog_layout = QGridLayout()
         jog_layout.setHorizontalSpacing(10) # Minimal space between the 2 columns
         jog_layout.setVerticalSpacing(4)
+
+        # Jog speed in percent of maximum axis speed, used by buttons and keyboard.
+        self.btn_jog_toggle = QPushButton("ON")
+        self.btn_jog_toggle.setCheckable(True)
+        self.btn_jog_toggle.setChecked(True)
+        self.btn_jog_toggle.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_jog_toggle.setFixedSize(48, 20)
+        self.btn_jog_toggle.setStyleSheet(
+            "QPushButton { padding: 0px; font-weight: bold; background-color: #7f2a2a; color: white; }"
+            "QPushButton:checked { background-color: #2e7d32; }"
+        )
+        self.btn_jog_toggle.setToolTip("Enable or disable jogging (buttons and keyboard)")
+        self.btn_jog_toggle.toggled.connect(self._on_jog_toggled)
+        jog_group.set_title_widget(self.btn_jog_toggle)
+
+        self.spin_jog_speed = QDoubleSpinBox()
+        self.spin_jog_speed.setRange(1.0, 100.0)
+        self.spin_jog_speed.setValue(15.0)
+        self.spin_jog_speed.setDecimals(0)
+        self.spin_jog_speed.setSuffix(" %")
+        self.spin_jog_speed.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.spin_jog_speed.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.spin_jog_speed.setFixedWidth(60)
+        self.spin_jog_speed.setToolTip("Jog speed (percent of maximum axis speed)")
+        self.btn_jog_speed_down = QPushButton("−")
+        self.btn_jog_speed_up = QPushButton("+")
+        for step_btn, delta in ((self.btn_jog_speed_down, -5.0), (self.btn_jog_speed_up, 5.0)):
+            step_btn.setFixedWidth(28)
+            step_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            step_btn.setAutoRepeat(True)
+            step_btn.clicked.connect(lambda _=False, d=delta: self.spin_jog_speed.setValue(self.spin_jog_speed.value() + d))
+        self.slider_jog_speed = QSlider(Qt.Orientation.Horizontal)
+        self.slider_jog_speed.setRange(1, 100)
+        self.slider_jog_speed.setValue(15)
+        self.slider_jog_speed.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.slider_jog_speed.valueChanged.connect(lambda v: self.spin_jog_speed.setValue(float(v)))
+        self.spin_jog_speed.valueChanged.connect(self._on_jog_speed_changed)
+        jog_speed_row = QHBoxLayout()
+        jog_speed_row.addWidget(QLabel("Speed:"))
+        jog_speed_row.addWidget(self.slider_jog_speed, 1)
+        jog_speed_row.addWidget(self.btn_jog_speed_down)
+        jog_speed_row.addWidget(self.spin_jog_speed)
+        jog_speed_row.addWidget(self.btn_jog_speed_up)
+        jog_layout.addLayout(jog_speed_row, 3, 0, 1, 2)
         
         joint_configs = [
             ("J1", "A", "D", "A1"), ("J2", "W", "S", "A2"),
@@ -391,9 +454,9 @@ class MainWindow(QMainWindow):
             
             btn_neg.setEnabled(False)
             btn_pos.setEnabled(False)
-            btn_neg.pressed.connect(lambda a=axis: self.start_jog_with_realtime(a, -15.0))
+            btn_neg.pressed.connect(lambda a=axis: self.start_jog_with_realtime(a, -self.spin_jog_speed.value()))
             btn_neg.released.connect(self.stop_jog_with_realtime)
-            btn_pos.pressed.connect(lambda a=axis: self.start_jog_with_realtime(a, 15.0))
+            btn_pos.pressed.connect(lambda a=axis: self.start_jog_with_realtime(a, self.spin_jog_speed.value()))
             btn_pos.released.connect(self.stop_jog_with_realtime)
             
             # Pack Label and Buttons tightly together into an inner horizontal layout
@@ -422,7 +485,7 @@ class MainWindow(QMainWindow):
         jog_layout_container.addStretch()
 
         # 3. Joint Angles Group
-        sensor_group = QGroupBox("Joint Angles")
+        sensor_group = QGroupBox()
         sensor_layout = QGridLayout()
         sensor_layout.setHorizontalSpacing(4) # Tighten column spacing
         sensor_layout.setVerticalSpacing(4)   # Tighten row spacing
@@ -430,13 +493,13 @@ class MainWindow(QMainWindow):
         self.lbl_joints = [QLabel(f"J{i+1}: -- °") for i in range(6)]
         for i, lbl in enumerate(self.lbl_joints):
             lbl.setStyleSheet("font-family: monospace; color: #00FF00; background-color: #111; padding: 2px;")
-            row = i // 2
-            col = i % 2
+            row = i // 3
+            col = i % 3
             sensor_layout.addWidget(lbl, row, col)
             
         sensor_group.setLayout(sensor_layout)
 
-        position_group = QGroupBox("Current Position")
+        position_group = QGroupBox()
         position_layout = QHBoxLayout()
         self.lbl_position = [QLabel(f"{axis}: -- mm") for axis in ("X", "Y", "Z")]
         for label in self.lbl_position:
@@ -445,28 +508,26 @@ class MainWindow(QMainWindow):
         position_group.setLayout(position_layout)
 
         # 4. Real-time Status & Diagnostics
-        diag_group = QGroupBox("Diagnostics")
+        diag_group = QGroupBox()
         diag_layout = QGridLayout()
         diag_layout.setHorizontalSpacing(6)
         diag_layout.setVerticalSpacing(6)
 
+        # Supply voltage is no longer displayed; the label is kept for the update code.
         self.lbl_supply_voltage = QLabel("Supply Voltage: 24 V")
-        self.lbl_supply_voltage.setStyleSheet("font-family: monospace; color: #00FF00; background-color: #111; padding: 3px;")
-        diag_layout.addWidget(self.lbl_supply_voltage, 0, 0, 1, 2)
+
+        self.lbl_total_current = QLabel("Total: -- mA")
+        self.lbl_total_current.setStyleSheet("font-family: monospace; color: #00FF00; background-color: #111; padding: 3px;")
+        diag_layout.addWidget(self.lbl_total_current, 0, 0, 1, 2)
 
         self.lbl_power = QLabel("Power: -- W")
         self.lbl_power.setStyleSheet("font-family: monospace; color: #00FF00; background-color: #111; padding: 3px;")
-        diag_layout.addWidget(self.lbl_power, 1, 0, 1, 2)
-
-        self.lbl_total_current = QLabel("Total Joint Current: -- mA")
-        self.lbl_total_current.setStyleSheet("font-family: monospace; color: #00FF00; background-color: #111; padding: 3px;")
-        diag_layout.addWidget(self.lbl_total_current, 2, 0, 1, 2)
-
+        diag_layout.addWidget(self.lbl_power, 0, 2)
         self.lbl_joint_currents = [QLabel(f"J{i+1}: -- mA") for i in range(6)]
         for i, lbl in enumerate(self.lbl_joint_currents):
             lbl.setStyleSheet("font-family: monospace; color: #00FF00; background-color: #111; padding: 3px;")
-            row = 3 + (i // 2)
-            col = i % 2
+            row = 1 + (i // 3)
+            col = i % 3
             diag_layout.addWidget(lbl, row, col)
 
         diag_group.setLayout(diag_layout)
@@ -475,15 +536,16 @@ class MainWindow(QMainWindow):
         status_layout = QVBoxLayout(status_panel)
         status_layout.setContentsMargins(6, 10, 6, 6)
         status_layout.setSpacing(4)
+        # Untitled boxes: no frame or heading space, so the blocks sit tightly together.
+        for untitled_box in (flow_group, position_group, sensor_group, diag_group):
+            untitled_box.setStyleSheet("QGroupBox { border: none; margin-top: 0px; padding-top: 0px; }")
+            untitled_box.layout().setContentsMargins(0, 0, 0, 0)
+        status_layout.addWidget(flow_group)
+        status_layout.addSpacing(6)
         status_layout.addWidget(position_group)
         status_layout.addWidget(sensor_group)
+        status_layout.addSpacing(6)
         status_layout.addWidget(diag_group)
-
-        connection_scroll = QScrollArea()
-        connection_scroll.setWidgetResizable(True)
-        connection_scroll.setWidget(connection_tab)
-        connection_scroll.setStyleSheet("QScrollArea { border: none; }")
-        left_tabs.addTab(connection_scroll, "Connection")
 
         jog_scroll = QScrollArea()
         jog_scroll.setWidgetResizable(True)
@@ -492,99 +554,24 @@ class MainWindow(QMainWindow):
         left_tabs.addTab(jog_scroll, "JOG")
 
         # ---- Pathways tab: geometry, constraints, points, playback ----
-        traj_tab = QWidget()
-        sim_layout = QVBoxLayout(traj_tab)
-        sim_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        sim_layout.setContentsMargins(6, 6, 6, 6)
-        sim_layout.setSpacing(8)
-
-        path_layout = QHBoxLayout()
-        path_layout.addWidget(QLabel("Path type:") )
-        self.combo_path_mode = QComboBox()
-        self.combo_path_mode.addItems(["Joint interpolation", "Cartesian straight line"])
-        path_layout.addWidget(self.combo_path_mode)
-        sim_layout.addLayout(path_layout)
-
-        constraint_group = QGroupBox("Cartesian constraints")
-        constraint_layout = QVBoxLayout()
-        lock_layout = QHBoxLayout()
-        lock_layout.addWidget(QLabel("Lock:"))
-        self.lock_joint_checks = []
-        for joint_index in range(6):
-            check = QCheckBox(f"J{joint_index + 1}")
-            self.lock_joint_checks.append(check)
-            lock_layout.addWidget(check)
-        constraint_layout.addLayout(lock_layout)
-        self.chk_keep_orientation = QCheckBox("Keep tool orientation from start")
-        constraint_layout.addWidget(self.chk_keep_orientation)
-        constraint_group.setLayout(constraint_layout)
-        sim_layout.addWidget(constraint_group)
-
-        # Start point
-        start_group = QGroupBox("Start (X, Y, Z mm)")
-        start_layout = QGridLayout()
-        self.start_inputs = []
-        labels = ["X:", "Y:", "Z:"]
-        default_start = [200.0, 0.0, 400.0]
-        for i in range(3):
-            start_layout.addWidget(QLabel(labels[i]), i, 0)
-            spin_box = QDoubleSpinBox()
-            spin_box.setRange(-800.0, 800.0)
-            spin_box.setSingleStep(10.0)
-            spin_box.setValue(default_start[i])
-            spin_box.valueChanged.connect(self.update_visual_points)
-            start_layout.addWidget(spin_box, i, 1)
-            self.start_inputs.append(spin_box)
-        start_group.setLayout(start_layout)
-
-        # Place Start and Target side-by-side to save vertical space
-        points_layout = QHBoxLayout()
-        points_layout.addWidget(start_group)
-
-        # Target point
-        target_group = QGroupBox("Target (X, Y, Z mm)")
-        target_layout = QGridLayout()
-        self.target_inputs = []
-        default_target = [200.0, 200.0, 200.0]
-        for i in range(3):
-            target_layout.addWidget(QLabel(labels[i]), i, 0)
-            spin_box = QDoubleSpinBox()
-            spin_box.setRange(-800.0, 800.0)
-            spin_box.setSingleStep(10.0)
-            spin_box.setValue(default_target[i])
-            spin_box.valueChanged.connect(self.update_visual_points)
-            target_layout.addWidget(spin_box, i, 1)
-            self.target_inputs.append(spin_box)
-        target_group.setLayout(target_layout)
-        points_layout.addWidget(target_group)
-
-        sim_layout.addLayout(points_layout)
-
-        resolution_layout = QHBoxLayout()
-        resolution_layout.addWidget(QLabel("Waypoints:"))
-        self.spin_waypoint_count = QSpinBox()
-        self.spin_waypoint_count.setRange(2, 500)
-        self.spin_waypoint_count.setValue(30)
-        resolution_layout.addWidget(self.spin_waypoint_count)
-        sim_layout.addLayout(resolution_layout)
-
-        # Plan simulation button
-        self.btn_run_sim = QPushButton("Calculate Path")
-        self.btn_run_sim.setStyleSheet("background-color: #27ae60; color: white; padding: 6px; font-size: 12px; font-weight: bold;")
-        self.btn_run_sim.clicked.connect(self.trigger_simulation)
-        sim_layout.addWidget(self.btn_run_sim)
-
-        self.btn_export_path = QPushButton("Export Pathway CSV")
-        self.btn_export_path.setEnabled(False)
-        self.btn_export_path.clicked.connect(self.export_cri_path)
-        sim_layout.addWidget(self.btn_export_path)
+        # ---- Trajectory Studio: sequence builder (left) ----
+        self.sequence_builder = SequenceBuilderWidget()
+        self.sequence_builder.generate_requested.connect(self.generate_sequence)
+        self.sequence_builder.export_requested.connect(self.export_cri_path)
+        self.sequence_builder.points_changed.connect(self.update_visual_points)
+        self.btn_export_path = self.sequence_builder.btn_export
+        self.sequence_planner = SequencePlanner(self.kinematics, self.path_planner)
+        self.sequence_builder.validator = lambda step: self.sequence_planner.validate_step(
+            step, self.current_sim_angles
+        )
+        self.sequence_plan = None
 
         # ---- Execution tab: trajectory selection, run settings, and live metrics ----
         execution_tab = QWidget()
         execution_layout = QVBoxLayout(execution_tab)
         execution_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
-        execution_layout.setContentsMargins(6, 6, 6, 6)
-        execution_layout.setSpacing(8)
+        execution_layout.setContentsMargins(6, 4, 6, 4)
+        execution_layout.setSpacing(4)
 
         trajectory_group = QGroupBox("Trajectory to Execute")
         trajectory_layout = QGridLayout(trajectory_group)
@@ -604,16 +591,13 @@ class MainWindow(QMainWindow):
         trajectory_layout.addWidget(self.cmb_trajectory_files, 0, 1, 1, 2)
         trajectory_layout.addWidget(self.btn_load_trajectory, 1, 1)
         trajectory_layout.addWidget(self.btn_browse_trajectory, 1, 2)
-        self.btn_trajectory_studio = QPushButton("Trajectory Studio...")
-        self.btn_trajectory_studio.setToolTip("Author, preview and validate trajectories (no robot motion)")
-        self.btn_trajectory_studio.clicked.connect(self.open_trajectory_studio)
-        trajectory_layout.addWidget(self.btn_trajectory_studio, 1, 0)
         trajectory_layout.addWidget(QLabel("Loaded:"), 2, 0)
         trajectory_layout.addWidget(self.lbl_loaded_trajectory, 2, 1, 1, 2)
-        trajectory_layout.addWidget(self.lbl_loaded_waypoints, 3, 0, 1, 3)
+        trajectory_layout.addWidget(self.lbl_loaded_waypoints, 3, 0, 1, 2)
+        trajectory_layout.addWidget(self.lbl_trajectory_status, 3, 2)
         trajectory_layout.addWidget(self.lbl_loaded_start, 4, 0, 1, 3)
         trajectory_layout.addWidget(self.lbl_loaded_target, 5, 0, 1, 3)
-        trajectory_layout.addWidget(self.lbl_trajectory_status, 6, 0, 1, 3)
+        trajectory_layout.setVerticalSpacing(4)
         execution_layout.addWidget(trajectory_group)
 
         run_settings_layout = QHBoxLayout()
@@ -625,17 +609,30 @@ class MainWindow(QMainWindow):
         self.spin_robot_velocity.setToolTip("CRI velocity used for preparation and task motion")
         run_settings_layout.addWidget(QLabel("Motion speed:"))
         run_settings_layout.addWidget(self.spin_robot_velocity)
-        self.btn_identification_settings = QPushButton("Identification Settings...")
-        self.btn_identification_settings.clicked.connect(self.open_identification_settings)
-        run_settings_layout.addWidget(self.btn_identification_settings)
-        run_settings_layout.addStretch()
-        execution_layout.addLayout(run_settings_layout)
-
         self.btn_execute_path = QPushButton("Run")
         self.btn_execute_path.setStyleSheet("background-color: #c0392b; color: white; padding: 6px; font-weight: bold;")
         self.btn_execute_path.setEnabled(False)
         self.btn_execute_path.clicked.connect(self.execute_path)
-        execution_layout.addWidget(self.btn_execute_path)
+        run_settings_layout.addWidget(self.btn_execute_path, 1)
+        execution_layout.addLayout(run_settings_layout)
+
+        identification_tab = QWidget()
+        identification_layout = QVBoxLayout(identification_tab)
+        identification_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        identification_layout.setContentsMargins(6, 6, 6, 6)
+        identification_layout.setSpacing(8)
+
+        identification_group = QGroupBox("Identification Run")
+        identification_group_layout = QVBoxLayout(identification_group)
+        identification_info = QLabel(
+            "Record robot telemetry for an identification experiment. "
+            "Connect to the robot before starting a run."
+        )
+        identification_info.setWordWrap(True)
+        identification_group_layout.addWidget(identification_info)
+        self.btn_identification_settings = QPushButton("Identification Settings...")
+        self.btn_identification_settings.clicked.connect(self.open_identification_settings)
+        identification_group_layout.addWidget(self.btn_identification_settings)
 
         identification_controls = QHBoxLayout()
         self.btn_start_identification = QPushButton("Start Identification Run")
@@ -646,7 +643,8 @@ class MainWindow(QMainWindow):
         self.btn_stop_identification.clicked.connect(self.stop_identification_recording)
         identification_controls.addWidget(self.btn_start_identification)
         identification_controls.addWidget(self.btn_stop_identification)
-        execution_layout.addLayout(identification_controls)
+        identification_group_layout.addLayout(identification_controls)
+        identification_layout.addWidget(identification_group)
 
         # Playback controls
         playback_layout = QVBoxLayout()
@@ -675,7 +673,9 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.btn_stop)
         playback_layout.addLayout(controls_layout)
 
-        sim_layout.addLayout(playback_layout)
+        self.lbl_sim_segment = QLabel("Segment: --")
+        self.lbl_sim_segment.setStyleSheet("color: #f1c40f; font-size: 11px;")
+        playback_layout.insertWidget(0, self.lbl_sim_segment)
 
         # Simulation / Real-time Options Row
         opts_layout = QHBoxLayout()
@@ -688,77 +688,67 @@ class MainWindow(QMainWindow):
         self.chk_real_time_trail.toggled.connect(self.real_view_trail_visibility_changed)
         opts_layout.addWidget(self.chk_real_time_trail)
 
-        sim_layout.addLayout(opts_layout)
+        # Playback sits under the simulation view on the right of the Trajectory Studio.
+        self.studio_playback_widget = QWidget()
+        studio_playback_layout = QVBoxLayout(self.studio_playback_widget)
+        studio_playback_layout.setContentsMargins(0, 0, 0, 0)
+        studio_playback_layout.addLayout(playback_layout)
+        studio_playback_layout.addLayout(opts_layout)
 
-        # Close out the Path Planning tab
-        traj_scroll = QScrollArea()
-        traj_scroll.setWidgetResizable(True)
-        traj_scroll.setWidget(traj_tab)
-        traj_scroll.setStyleSheet("QScrollArea { border: none; }")
-        left_tabs.addTab(traj_scroll, "Pathways")
-
-        session_group = QGroupBox("Execution Session")
-        session_layout = QGridLayout()
-        session_layout.setHorizontalSpacing(6)
-        session_layout.setVerticalSpacing(6)
         self.lbl_execution_timer = QLabel("00:00.0")
         self.lbl_execution_energy = QLabel("0.000 J (0.000 Wh)")
         for label in (self.lbl_execution_timer, self.lbl_execution_energy):
-            label.setStyleSheet("font-family: monospace; color: #00FF00; background-color: #111; padding: 4px;")
-        session_layout.addWidget(QLabel("Elapsed time:"), 0, 0)
-        session_layout.addWidget(self.lbl_execution_timer, 0, 1)
-        session_layout.addWidget(QLabel("Total energy:"), 1, 0)
-        session_layout.addWidget(self.lbl_execution_energy, 1, 1)
-        session_group.setLayout(session_layout)
-        execution_layout.addWidget(session_group)
+            label.setStyleSheet("font-family: monospace; color: #00FF00; background-color: #111; padding: 2px 6px;")
         
-        # Export real-time diagnostics data
+        # Export diagnostics and Move to Start share one row
         export_diag_layout = QHBoxLayout()
-        self.btn_export_voltage_csv = QPushButton("📥 Export Diagnostics CSV")
+        export_diag_layout.setSpacing(4)
+        self.btn_export_voltage_csv = QPushButton("📥 Export CSV")
         self.btn_export_voltage_csv.setStyleSheet("background-color: #8e44ad; color: white; padding: 5px; font-weight: bold; font-size: 10px;")
+        self.btn_export_voltage_csv.setToolTip("Export Diagnostics CSV")
         self.btn_export_voltage_csv.clicked.connect(self.export_diagnostics_csv)
         export_diag_layout.addWidget(self.btn_export_voltage_csv)
-        execution_layout.addLayout(export_diag_layout)
-        
-        # Robot control buttons (Move to Start & Execute)
-        robot_control_layout = QHBoxLayout()
-        robot_control_layout.setSpacing(2)
-        
-        # Button: Move to Start Position
+
         self.btn_move_to_start = QPushButton("🎯 Move to Start")
         self.btn_move_to_start.setStyleSheet("background-color: #16a085; color: white; padding: 5px; font-weight: bold; font-size: 10px;")
         self.btn_move_to_start.setEnabled(False)
         self.btn_move_to_start.clicked.connect(self.move_to_start)
-        robot_control_layout.addWidget(self.btn_move_to_start)
-        
-        execution_layout.addLayout(robot_control_layout)
+        export_diag_layout.addWidget(self.btn_move_to_start)
+        execution_layout.addLayout(export_diag_layout)
         execution_layout.addStretch()
 
         self._populate_trajectory_files()
 
         execution_scroll = QScrollArea()
         execution_scroll.setWidgetResizable(True)
+        execution_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         execution_scroll.setWidget(execution_tab)
         execution_scroll.setStyleSheet("QScrollArea { border: none; }")
         left_tabs.addTab(execution_scroll, "Execution")
 
+        identification_scroll = QScrollArea()
+        identification_scroll.setWidgetResizable(True)
+        identification_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        identification_scroll.setWidget(identification_tab)
+        identification_scroll.setStyleSheet("QScrollArea { border: none; }")
+        left_tabs.addTab(identification_scroll, "Identification")
+
         # Purple tab strip and orange content area remain above the green footer.
         left_sidebar_layout.addWidget(status_panel)
         left_sidebar_layout.addWidget(left_tabs, 1)
+        self.btn_trajectory_studio = QPushButton("Trajectory Studio...")
+        self.btn_trajectory_studio.setToolTip("Plan pathways and preview them in the simulation view")
+        self.btn_trajectory_studio.clicked.connect(self.open_trajectory_studio)
+        left_sidebar_layout.addWidget(self.btn_trajectory_studio)
 
         # ==========================================
-        # RIGHT PANEL: Tabbed CAD Views (Simulation + Real-time)
+        # RIGHT PANEL: Real-time view (the simulation view lives in the Trajectory Studio)
         # ==========================================
         self.view_tabs = QTabWidget()
         self.view_tabs.setMinimumWidth(620)
 
-        # Simulation View Tab
-        sim_tab = QWidget()
-        sim_tab_layout = QVBoxLayout(sim_tab)
-        sim_tab_layout.setContentsMargins(6, 6, 6, 6)
+        # Simulation viewer: hosted by the Trajectory Studio window.
         self.sim_view = StickViewer()
-        sim_tab_layout.addWidget(self.sim_view)
-        self.view_tabs.addTab(sim_tab, "Simulation View")
 
         # Real-time View Tab
         real_tab = QWidget()
@@ -788,6 +778,17 @@ class MainWindow(QMainWindow):
         diagnostics_tabs.addTab(self.tuning_panel, "Algorithm Tuning")
         diagnostics_tabs.setMinimumHeight(250)
 
+        # Execution session readout sits on the tab-bar line, right-aligned.
+        session_corner = QWidget()
+        session_corner_layout = QHBoxLayout(session_corner)
+        session_corner_layout.setContentsMargins(6, 0, 6, 0)
+        session_corner_layout.setSpacing(6)
+        session_corner_layout.addWidget(QLabel("Elapsed time:"))
+        session_corner_layout.addWidget(self.lbl_execution_timer)
+        session_corner_layout.addWidget(QLabel("Total energy:"))
+        session_corner_layout.addWidget(self.lbl_execution_energy)
+        diagnostics_tabs.setCornerWidget(session_corner, Qt.Corner.TopRightCorner)
+
         realtime_splitter = QSplitter(Qt.Orientation.Vertical)
         self.real_view.setMinimumHeight(300)
         realtime_splitter.addWidget(self.real_view)
@@ -799,9 +800,16 @@ class MainWindow(QMainWindow):
         realtime_splitter.setSizes([560, 300])
         real_tab_layout.addWidget(realtime_splitter, 1)
         self.view_tabs.addTab(real_tab, "Real-time View")
+        self.real_tab = real_tab
 
         main_layout.addWidget(left_sidebar)
         main_layout.addWidget(self.view_tabs, 1)
+
+        from gui.trajectory_studio_window import TrajectoryStudioWindow
+        self.trajectory_studio = TrajectoryStudioWindow(
+            self.sequence_builder, self.sim_view, self.studio_playback_widget, self
+        )
+        self.trajectory_studio.setWindowFlag(Qt.WindowType.Window, True)
 
 
 
@@ -810,16 +818,12 @@ class MainWindow(QMainWindow):
     # ==========================================
 
     def update_visual_points(self):
-        start_xyz = [box.value() for box in self.start_inputs]
-        target_xyz = [box.value() for box in self.target_inputs]
-        # Simulation view should show start/target points
-        self.sim_view.set_visual_points(start_xyz, target_xyz)
-        # Real-time view does not need start/target markers, but keep synced optionally
-        self.real_view.set_visual_points(start_xyz, target_xyz)
+        start, end = self.sequence_builder.endpoints()
+        self.sim_view.set_visual_points(list(start), list(end), self.sequence_builder.chain())
 
     def _show_realtime_view(self):
         """Focus the live view before any command that moves the robot."""
-        self.view_tabs.setCurrentIndex(1)
+        self.view_tabs.setCurrentWidget(self.real_tab)
 
     def _execution_motion_speed(self):
         return float(self.spin_robot_velocity.value())
@@ -869,23 +873,9 @@ class MainWindow(QMainWindow):
         self.load_trajectory_file(file_path)
 
     def open_trajectory_studio(self):
-        from gui.trajectory_studio_window import TrajectoryStudioWindow
-        if getattr(self, "trajectory_studio", None) is None:
-            def live_pose():
-                if not self.manager.robot.connected:
-                    return None
-                return list(self.manager.get_joint_angles_list())
-
-            self.trajectory_studio = TrajectoryStudioWindow(
-                self, pathways_dir=self._trajectory_directory(), robot_pose_provider=live_pose)
-            self.trajectory_studio.setWindowFlag(Qt.WindowType.Window, True)
-            self.trajectory_studio.loadRequested.connect(self._on_studio_load_requested)
         self.trajectory_studio.show()
         self.trajectory_studio.raise_()
-
-    def _on_studio_load_requested(self, file_path):
-        self._populate_trajectory_files()
-        self.load_trajectory_file(file_path)
+        self.trajectory_studio.activateWindow()
 
     def browse_trajectory_file(self):
         directory = self._trajectory_directory()
@@ -1178,70 +1168,8 @@ class MainWindow(QMainWindow):
         self.sim_view.clear_tip_trail()
         self.real_view.clear_tip_trail()
 
-    def trigger_simulation(self):
-        self.view_tabs.setCurrentIndex(0)
-        self.real_tip_trail.clear()
-        self.realtime_trail_active = False
-        self.real_view.clear_tip_trail()
-        start_xyz = [box.value() for box in self.start_inputs]
-        target_xyz = [box.value() for box in self.target_inputs]
-        waypoint_count = self.spin_waypoint_count.value()
-        
-        selected_locks = {
-            index: self.current_sim_angles[index]
-            for index, check in enumerate(self.lock_joint_checks)
-            if check.isChecked()
-        }
-        start_angles = self.kinematics.inverse_kinematics(
-            start_xyz,
-            initial_guess_angles=self.current_sim_angles,
-            locked_joints=selected_locks,
-        )
-        if start_angles is None:
-            self._show_ik_failure("starting point")
-            return
-
-        self.current_sim_angles = start_angles
-        
-        locked_joints = {index: start_angles[index] for index in selected_locks}
-        if self.combo_path_mode.currentText() == "Cartesian straight line":
-            target_rotation = None
-            if self.chk_keep_orientation.isChecked():
-                target_rotation = self.kinematics.get_tip_transform(
-                    np.radians(start_angles)
-                )[:3, :3]
-
-            def solve_waypoint(point, previous_angles):
-                return self.kinematics.inverse_kinematics(
-                    point,
-                    initial_guess_angles=previous_angles or start_angles,
-                    locked_joints=locked_joints,
-                    target_rotation=target_rotation,
-                )
-
-            try:
-                temp_path = self.path_planner.generate_cartesian_line(
-                    start_xyz, target_xyz, waypoint_count, solve_waypoint
-                )
-            except ValueError:
-                self._show_ik_failure("Cartesian line")
-                return
-        else:
-            target_angles = self.kinematics.inverse_kinematics(
-                target_xyz,
-                initial_guess_angles=start_angles,
-                locked_joints=locked_joints,
-            )
-            if target_angles is None:
-                self._show_ik_failure("target point")
-                return
-            for index, angle in locked_joints.items():
-                target_angles[index] = angle
-
-            temp_path = self.path_planner.generate_joint_path(
-                start_angles, target_angles, waypoint_count
-            )
-
+    def _apply_planned_path(self, temp_path):
+        """Load a planned joint path into the preview, playback and export state."""
         self.pre_sim_angles = self.current_sim_angles.copy()
         self.sim_path_full = list(temp_path)
         
@@ -1272,6 +1200,50 @@ class MainWindow(QMainWindow):
         self.btn_move_to_start.setEnabled(self.total_frames > 0 and self.manager.robot.connected)
         self.btn_execute_path.setEnabled(bool(self.loaded_trajectory_plan) and self.manager.robot.connected)
 
+    def generate_sequence(self):
+        """Plan every step of the sequence builder into one continuous pathway."""
+        steps = self.sequence_builder.steps()
+        if not steps:
+            QMessageBox.information(self, "Empty Sequence", "Add at least one step to the sequence.")
+            return
+
+        self.open_trajectory_studio()
+        self.real_tip_trail.clear()
+        self.realtime_trail_active = False
+        self.real_view.clear_tip_trail()
+
+        results = self.sequence_planner.check_steps(steps, self.current_sim_angles)
+        self.sequence_builder.set_step_status(results)
+        failures = [text for text in results if text]
+        if failures:
+            self.sequence_builder.set_summary(f"{len(failures)} of {len(steps)} step(s) cannot move.")
+            QMessageBox.critical(
+                self, "Sequence Cannot Be Generated",
+                "These steps cannot be executed:\n\n" + "\n\n".join(failures)
+                + "\n\nFix or remove them (see the ✖ marks in the list).",
+            )
+            return
+
+        try:
+            plan = self.sequence_planner.plan(steps, self.current_sim_angles)
+        except SequenceError as error:
+            QMessageBox.critical(self, "Sequence Cannot Be Planned", str(error))
+            return
+
+        self.sequence_plan = plan
+        self.current_sim_angles = list(plan.path[0])
+        self._apply_planned_path(plan.path)
+        self.update_visual_points()
+        bridges = sum(1 for segment in plan.segments if segment.is_bridge)
+        self.sequence_builder.set_summary(
+            f"{len(steps)} step(s) + {bridges} auto re-orient move(s) = {len(plan.path)} frames."
+        )
+        self._update_segment_label()
+
+    def _update_segment_label(self):
+        segment = self.sequence_plan.segment_at(self.current_frame) if self.sequence_plan else None
+        self.lbl_sim_segment.setText(f"Segment: {segment.label}" if segment else "Segment: --")
+
     def _show_ik_failure(self, stage):
         reason = self.kinematics.last_ik_error or "the requested point is outside the robot workspace"
         QMessageBox.critical(
@@ -1298,6 +1270,8 @@ class MainWindow(QMainWindow):
         self.current_frame = 0
         self.total_frames = 0
         self.sim_path_full = []
+        self.sequence_plan = None
+        self.lbl_sim_segment.setText("Segment: --")
         self.current_sim_angles = self.pre_sim_angles.copy()
 
         self.playback_slider.setEnabled(False)
@@ -1313,10 +1287,9 @@ class MainWindow(QMainWindow):
         self._reset_trails()
 
         # Immediately restore the previous simulated pose
-        for i, angle in enumerate(self.current_sim_angles):
-            self.lbl_joints[i].setText(f"J{i+1}: {angle:.1f}° (SIM)")
         rad_angles = np.radians(self.current_sim_angles)
         points = self.kinematics.get_stick_points(rad_angles)
+        self.trajectory_studio.set_simulated_pose(self.current_sim_angles, points[-1])
         self.sim_view.update_view(points)
 
     def on_playback_slider_changed(self, value):
@@ -1324,6 +1297,7 @@ class MainWindow(QMainWindow):
             return
         self.current_frame = value
         self.lbl_playback_frame.setText(f"Frame: {self.current_frame + 1} / {self.total_frames}")
+        self._update_segment_label()
 
         # Redraw the view immediately when the slider is used, preserving cumulative trail.
         display_angles = self.sim_path_full[self.current_frame]
@@ -1592,8 +1566,9 @@ class MainWindow(QMainWindow):
             self.status_label.setStyleSheet("font-weight: bold; color: green;")
             self.btn_connect.setEnabled(False)
             self.btn_start_identification.setEnabled(True)
-            for btn in [self.btn_disconnect, self.btn_reset, self.btn_enable, self.btn_home] + self.jog_buttons:
+            for btn in [self.btn_disconnect, self.btn_reset, self.btn_enable, self.btn_home]:
                 btn.setEnabled(True)
+            self._update_jog_enabled()
             # Enable robot control buttons if a path is loaded.
             if self.total_frames > 0:
                 self.btn_move_to_start.setEnabled(True)
@@ -1629,16 +1604,25 @@ class MainWindow(QMainWindow):
         if closed_run is not None:
             self._show_identification_close_summary(closed_run)
         self.btn_connect.setEnabled(True)
-        for btn in [self.btn_disconnect, self.btn_reset, self.btn_enable, self.btn_home] + self.jog_buttons:
+        for btn in [self.btn_disconnect, self.btn_reset, self.btn_enable, self.btn_home]:
             btn.setEnabled(False)
+        self.pressed_keys.clear()
+        self._update_jog_enabled()
         self.btn_move_to_start.setEnabled(False)
         self.btn_execute_path.setEnabled(False)
         self.real_view.toggle_trail(False)
         self.lbl_supply_voltage.setText("Supply Voltage: 24 V")
-        self.lbl_total_current.setText("Total Joint Current: -- mA")
+        for i, label in enumerate(self.lbl_joints):
+            label.setText(f"J{i+1}: -- °")
+        for label, axis in zip(self.lbl_position, ("X", "Y", "Z")):
+            label.setText(f"{axis}: -- mm")
+        for i, label in enumerate(self.lbl_joint_currents):
+            label.setText(f"J{i+1}: -- mA")
+        self.lbl_total_current.setText("Total: -- mA")
         self.lbl_power.setText("Power: -- W")
 
     def closeEvent(self, event):
+        self.trajectory_studio.close()
         self.execution_latency.cancel_pending()
         self._flush_completed_latency_trials()
         self.stop_identification_recording(silent=True)
@@ -1773,7 +1757,11 @@ class MainWindow(QMainWindow):
                 wait_move_finished=True,
                 move_finished_timeout=60.0,
             )
-            self.move_to_start_error = None if success else "Robot move-to-start command failed or timed out. Check the robot status."
+            if success:
+                self.move_to_start_error = None
+            else:
+                detail = getattr(self.manager.robot, "last_move_error", "")
+                self.move_to_start_error = "Robot move-to-start command failed or timed out. Check the robot status." + (f"\n\nRobot reply: {detail}" if detail else "")
         except Exception as e:
             self.move_to_start_error = str(e)
         self.move_to_start_complete = True
@@ -1787,8 +1775,7 @@ class MainWindow(QMainWindow):
         if not self.manager.robot.connected:
             QMessageBox.warning(self, "Not Connected", "Robot is not connected. Please connect first.")
             return
-        if self.identification_logger is not None:
-            QMessageBox.warning(self, "Identification Run Active", "Stop and save the manual identification run before starting trajectory execution.")
+        if self.execution_state in {"PREPARING", "RECORDING/EXECUTING"}:
             return
 
         path_data = list(self.path_executor.path_data)
@@ -1806,37 +1793,30 @@ class MainWindow(QMainWindow):
 
         task_path = list(path_data)
 
+        for joint_index, (low, high) in enumerate(JOINT_LIMITS_DEG):
+            values = [float(point[joint_index]) for point in [start_angles, *task_path]]
+            if min(values) < low or max(values) > high:
+                worst = max(values, key=abs)
+                QMessageBox.warning(
+                    self, "Joint Limit Exceeded",
+                    f"This trajectory needs J{joint_index + 1} = {worst:.1f}°, but the robot limit is "
+                    f"{low:.0f}° to {high:.0f}°.\n\nRe-generate the pathway in the Trajectory Studio "
+                    "(the planner respects this limit) and export it again.",
+                )
+                return
+
         if not task_path:
             QMessageBox.warning(self, "No Task Motion", "The selected trajectory does not contain task motion after the start pose.")
             return
         
         try:
             velocity = self._execution_motion_speed()
-            metadata = self._get_identification_metadata()
-            metadata["trajectory_id"] = metadata.get("trajectory_id") or trajectory_plan.trajectory_id
-            if not all(str(metadata.get(key, "")).strip() for key in ("experiment_id", "trajectory_id", "run_id")):
-                QMessageBox.warning(self, "Incomplete Metadata", "Experiment ID, trajectory ID, and run ID are required before motion.")
-                return
-            if not self._confirm_identification_condition(metadata):
-                return
-            existing_run = find_existing_identification_run(
-                "identification_data", str(metadata["run_id"])
-            )
-            if existing_run is not None:
-                QMessageBox.warning(
-                    self,
-                    "Run ID Already Used",
-                    f"Run ID {metadata['run_id']} already appears in {existing_run.name}. "
-                    "Choose a new run ID before starting robot motion.",
-                )
-                return
             num_waypoints = len(task_path)
             
             # Confirm execution
             reply = QMessageBox.question(
-                self, "Run Experiment",
-                f"Prepare to start pose and execute {num_waypoints} task waypoints at {velocity}% velocity?\n\n"
-                "This will move to the CSV-defined start pose before the measured experiment motion.",
+                self, "Run Trajectory",
+                f"Move to the trajectory start pose, then run {num_waypoints} waypoints at {velocity:.0f}% velocity?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             
@@ -1867,7 +1847,7 @@ class MainWindow(QMainWindow):
             print(f"Starting trajectory execution with preparation to {start_angles} and {num_waypoints} task waypoints...")
             self.execution_thread = threading.Thread(
                 target=self._execute_path_worker,
-                args=(list(start_angles), task_path, velocity, metadata),
+                args=(list(start_angles), task_path, velocity),
                 daemon=True,
             )
             self.execution_thread.start()
@@ -1877,7 +1857,7 @@ class MainWindow(QMainWindow):
             self.btn_move_to_start.setEnabled(True)
             self.btn_execute_path.setEnabled(bool(self.loaded_trajectory_plan) and self.manager.robot.connected)
 
-    def _execute_path_worker(self, start_angles, task_path, velocity, metadata):
+    def _execute_path_worker(self, start_angles, task_path, velocity):
         error_message = None
         self.execution_error = None
         self.execution_complete = False
@@ -1896,11 +1876,11 @@ class MainWindow(QMainWindow):
                 move_finished_timeout=60.0,
             )
             if not success:
-                raise RuntimeError("Robot failed to reach the trajectory start pose.")
-
-            self.start_identification_recording(silent=True, metadata_override=metadata)
-            if self.identification_logger is None:
-                raise RuntimeError("Identification logging could not be started; task motion was not sent.")
+                detail = getattr(self.manager.robot, "last_move_error", "")
+                raise RuntimeError(
+                    "Robot failed to reach the trajectory start pose."
+                    + (f"\n\nRobot reply: {detail}" if detail else "")
+                )
 
             self.execution_state = "RECORDING/EXECUTING"
             task_start = time.monotonic()
@@ -1926,8 +1906,6 @@ class MainWindow(QMainWindow):
             self.execution_error = error_message
         finally:
             self.execution_session_active = False
-            if self.identification_logger is not None:
-                self.stop_identification_recording(silent=True)
             self.is_recording_diagnostics = False
             self.execution_complete = True
             self.execution_error = error_message
@@ -1981,14 +1959,12 @@ class MainWindow(QMainWindow):
 
             total_current = self.manager.get_total_current()
             total_current_text = f"{total_current:.3f} mA" if np.isfinite(total_current) else "unavailable"
-            self.lbl_total_current.setText(f"Total Joint Current: {total_current_text}")
+            self.lbl_total_current.setText(f"Total: {total_current_text}")
 
             self.lbl_supply_voltage.setText("Supply Voltage: 24 V")
             power_w = self.manager.get_supply_power_W()
             if np.isfinite(power_w):
-                self.lbl_power.setText(
-                    f"Power: {power_w:.2f} W (24 V × {total_current:.0f} mA / 1000)"
-                )
+                self.lbl_power.setText(f"Power: {power_w:.2f} W")
                 self._update_execution_metrics(time.monotonic(), power_w)
             else:
                 self.lbl_power.setText("Power: unavailable")
@@ -2045,8 +2021,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self,
                     "Run Complete",
-                    f"Task motion completed in {self.execution_elapsed:.2f} seconds.\n\n"
-                    f"Identification CSV saved to:\n{self.identification_output_path or 'identification_data'}",
+                    f"Trajectory completed in {self.execution_elapsed:.2f} seconds.",
                 )
             self.execution_complete = False
             self.execution_error = None
@@ -2070,41 +2045,103 @@ class MainWindow(QMainWindow):
         else:
             sim_display_angles = self.current_sim_angles
 
-        # Only show SIM suffix when robot is not connected
-        if not self.manager.robot.connected:
-            for i, angle in enumerate(sim_display_angles):
-                self.lbl_joints[i].setText(f"J{i+1}: {angle:.1f}° (SIM)")
-
         if self.total_frames > 0:
             self.playback_slider.blockSignals(True)
             self.playback_slider.setValue(self.current_frame)
             self.playback_slider.blockSignals(False)
             self.lbl_playback_frame.setText(f"Frame: {self.current_frame + 1} / {self.total_frames}")
+            self._update_segment_label()
 
         rad_sim = np.radians(sim_display_angles)
         sim_points = self.kinematics.get_stick_points(rad_sim)
+        self.trajectory_studio.set_simulated_pose(sim_display_angles, sim_points[-1])
         trail_points = None
         if self.total_frames > 0:
             trail_points = self.sim_tip_trail[: self.current_frame + 1]
         self.sim_view.update_view(sim_points, tip_trail=trail_points)
 
-    def keyPressEvent(self, event):
-        if not event.isAutoRepeat():
-            self.pressed_keys.add(event.key())
+    JOG_KEY_MAP = {
+        Qt.Key.Key_A: ("A1", -1), Qt.Key.Key_D: ("A1", 1),
+        Qt.Key.Key_W: ("A2", -1), Qt.Key.Key_S: ("A2", 1),
+        Qt.Key.Key_Q: ("A3", -1), Qt.Key.Key_E: ("A3", 1),
+        Qt.Key.Key_R: ("A4", -1), Qt.Key.Key_F: ("A4", 1),
+        Qt.Key.Key_T: ("A5", -1), Qt.Key.Key_G: ("A5", 1),
+        Qt.Key.Key_Y: ("A6", -1), Qt.Key.Key_H: ("A6", 1),
+    }
+
+    def _update_jog_enabled(self):
+        enabled = self.manager.robot.connected and self.btn_jog_toggle.isChecked()
+        for btn in self.jog_buttons:
+            btn.setEnabled(enabled)
+
+    def _on_jog_toggled(self, checked):
+        self.btn_jog_toggle.setText("ON" if checked else "OFF")
+        if not checked:
+            self.pressed_keys.clear()
+            if self.manager.robot.connected:
+                self.stop_jog_with_realtime()
+        self._update_jog_enabled()
+
+    def _on_jog_speed_changed(self, value):
+        self.slider_jog_speed.blockSignals(True)
+        self.slider_jog_speed.setValue(int(value))
+        self.slider_jog_speed.blockSignals(False)
+        # Apply a new speed immediately if a keyboard jog is in progress.
+        if self.pressed_keys:
             self.evaluate_keyboard_jog()
 
-    def keyReleaseEvent(self, event):
-        if not event.isAutoRepeat() and event.key() in self.pressed_keys:
-            self.pressed_keys.remove(event.key())
+    def eventFilter(self, obj, event):
+        # Application-wide filter so jog keys work regardless of which child widget has focus.
+        event_type = event.type()
+        if event_type in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            if not self.isActiveWindow():
+                return super().eventFilter(obj, event)
+            key = event.key()
+            is_jog_key = self.btn_jog_toggle.isChecked() and (key == Qt.Key.Key_I or key in self.JOG_KEY_MAP)
+            if not is_jog_key:
+                return super().eventFilter(obj, event)
+            focus = QApplication.focusWidget()
+            if isinstance(focus, (QLineEdit, QAbstractSpinBox)) or (
+                isinstance(focus, QComboBox) and focus.isEditable()
+            ):
+                return super().eventFilter(obj, event)
+            if event.isAutoRepeat():
+                return True
+            if event_type == QEvent.Type.KeyPress:
+                self.pressed_keys.add(key)
+                self.evaluate_keyboard_jog()
+            elif key in self.pressed_keys:
+                self.pressed_keys.discard(key)
+                self.evaluate_keyboard_jog()
+            return True
+        if event_type == QEvent.Type.WindowDeactivate and obj is self and self.pressed_keys:
+            # Never keep jogging if the window loses focus while keys are held.
+            self.pressed_keys.clear()
             self.evaluate_keyboard_jog()
+        return super().eventFilter(obj, event)
 
     def evaluate_keyboard_jog(self):
-        if not self.manager.robot.connected: return
-        for key in self.manager.current_jog_speeds:
-            self.manager.current_jog_speeds[key] = 0.0
-            
-        if Qt.Key.Key_I not in self.pressed_keys:
+        if not self.manager.robot.connected:
+            return
+
+        axis_speeds = {}
+        if Qt.Key.Key_I in self.pressed_keys:
+            speed = self.spin_jog_speed.value()
+            for key in self.pressed_keys:
+                if key in self.JOG_KEY_MAP:
+                    axis, sign = self.JOG_KEY_MAP[key]
+                    axis_speeds[axis] = axis_speeds.get(axis, 0.0) + sign * speed
+        # Opposing keys on one axis cancel out.
+        active = {axis: value for axis, value in axis_speeds.items() if value != 0.0}
+
+        if not active:
             self.stop_jog_with_realtime()
             return
-            
-        speed = 15
+
+        for axis in self.manager.current_jog_speeds:
+            self.manager.current_jog_speeds[axis] = 0.0
+        axes = list(active.items())
+        # The first axis goes through the tracked path so latency measurement still arms.
+        self.start_jog_with_realtime(axes[0][0], axes[0][1])
+        for axis, value in axes[1:]:
+            self.manager.start_jog(axis, value)

@@ -130,6 +130,12 @@ class StickViewer(QWidget):
         
         self.target_marker, = self.ax.plot([], [], [], 'ro', markersize=8, label='Target Point')
         self.target_proj, = self.ax.plot([], [], [], 'r--', alpha=0.6, lw=1.5)
+
+        # Sequence chain: P1..PN drawn lighter than the live start/target markers
+        self.chain_xyz = []
+        self.chain_labels = []
+        self.chain_line, = self.ax.plot([], [], [], 'o:', color='#95a5a6', markersize=7, lw=1,
+                                        alpha=0.45, label='Sequence Points')
         
         self.ax.legend(loc='upper right') # Moved legend to right to avoid overlapping with toolbar
         
@@ -170,7 +176,7 @@ class StickViewer(QWidget):
             label.set_visible(self.show_robot)
 
         for item in [self.start_marker, self.start_proj,
-                     self.target_marker, self.target_proj]:
+                     self.target_marker, self.target_proj, self.chain_line, *self.chain_labels]:
             item.set_visible(self.show_points)
 
         self.tip_trail_line.set_visible(self.show_trail)
@@ -210,10 +216,44 @@ class StickViewer(QWidget):
         self.tip_trail_line.set_3d_properties([])
         self.canvas.draw_idle()
 
-    def set_visual_points(self, start_xyz, target_xyz):
-        """Registers external frame inputs coordinates."""
+    def set_visual_points(self, start_xyz, target_xyz, chain_xyz=None):
+        """Registers external frame inputs coordinates.
+
+        start_xyz / target_xyz are the strong markers; chain_xyz is the ordered list of sequence
+        points (P1 = start of step 1, P2 = its end, ...) drawn lighter with numbers.
+        """
         self.start_xyz = start_xyz
         self.target_xyz = target_xyz
+        self.chain_xyz = [list(p) for p in (chain_xyz or [])]
+        self._draw_markers()
+        self.canvas.draw_idle()
+
+    def _draw_markers(self):
+        if self.start_xyz is not None:
+            sx, sy, sz = self.start_xyz
+            self.start_marker.set_data([sx], [sy])
+            self.start_marker.set_3d_properties([sz])
+            self.start_proj.set_data([sx, sx], [sy, sy])
+            self.start_proj.set_3d_properties([0, sz])
+
+        if self.target_xyz is not None:
+            tx, ty, tz = self.target_xyz
+            self.target_marker.set_data([tx], [ty])
+            self.target_marker.set_3d_properties([tz])
+            self.target_proj.set_data([tx, tx], [ty, ty])
+            self.target_proj.set_3d_properties([0, tz])
+
+        chain = np.array(self.chain_xyz, dtype=float).reshape(-1, 3)
+        self.chain_line.set_data(chain[:, 0], chain[:, 1])
+        self.chain_line.set_3d_properties(chain[:, 2])
+        for label in self.chain_labels:
+            label.remove()
+        self.chain_labels = [
+            self.ax.text(x + 12, y + 12, z + 12, f"P{i}", color='#7f8c8d', fontsize=8, alpha=0.8)
+            for i, (x, y, z) in enumerate(chain, start=1)
+        ]
+        for label in self.chain_labels:
+            label.set_visible(self.show_points)
 
     def update_view(self, points, tip_trail=None):
         """Redraws entire kinematics frame tree and tracking lines dynamically."""
@@ -226,24 +266,8 @@ class StickViewer(QWidget):
         self.line.set_data(x_data, y_data)
         self.line.set_3d_properties(z_data)
         
-        # 2. Update start reference tracking metrics
-        if self.start_xyz is not None:
-            sx, sy, sz = self.start_xyz
-            self.start_marker.set_data([sx], [sy])
-            self.start_marker.set_3d_properties([sz])
-            
-            self.start_proj.set_data([sx, sx], [sy, sy])
-            self.start_proj.set_3d_properties([0, sz])
-
-        # 3. Update target reference tracking metrics
-        if self.target_xyz is not None:
-            tx, ty, tz = self.target_xyz
-            self.target_marker.set_data([tx], [ty])
-            self.target_marker.set_3d_properties([tz])
-            
-            self.target_proj.set_data([tx, tx], [ty, ty])
-            self.target_proj.set_3d_properties([0, tz])
-        
+        # 2-3. Start / target / sequence point markers
+        self._draw_markers()
         # 4. Refresh spatial node texts tags
         for i in range(6):
             self.joint_labels[i].set_position((x_data[i+1] + 20, y_data[i+1] + 20))
