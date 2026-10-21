@@ -1,0 +1,20 @@
+{
+  "run_id": "identification_ID_NORMAL_006_trajectory_export_RUN_06_20261022T002058",
+  "source_file": "identification_data\\identification_ID_NORMAL_006_trajectory_export_RUN_06_20261022T002058.csv",
+  "source_sha256": "715e0499da4c07fb0d1946380719f33da3d2204c16b757ce6f5ef5a36d3f1cc1",
+  "files": [
+    "RUN_AUDIT.json",
+    "RUN_AUDIT.md",
+    "derivative_quality_plot.png",
+    "joint_current_plot.png",
+    "joint_position_plot.png",
+    "processed_dataset.csv",
+    "processed_dataset.csv.provenance.json",
+    "timing_diagnostics.csv"
+  ],
+  "plots": [
+    "joint_position_plot.png",
+    "joint_current_plot.png",
+    "derivative_quality_plot.png"
+  ]
+}

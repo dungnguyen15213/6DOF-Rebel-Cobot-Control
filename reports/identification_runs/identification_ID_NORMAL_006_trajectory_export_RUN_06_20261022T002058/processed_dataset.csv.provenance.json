@@ -1,0 +1,45 @@
+{
+  "source_file": "identification_data\\identification_ID_NORMAL_006_trajectory_export_RUN_06_20261022T002058.csv",
+  "source_sha256": "715e0499da4c07fb0d1946380719f33da3d2204c16b757ce6f5ef5a36d3f1cc1",
+  "processed_file": "reports\\identification_runs\\identification_ID_NORMAL_006_trajectory_export_RUN_06_20261022T002058\\processed_dataset.csv",
+  "units": {
+    "t_s": "s since first sample (host receive clock)",
+    "q*_rad": "rad",
+    "qdot*_rad_s": "rad/s",
+    "qddot*_rad_s2": "rad/s^2",
+    "current*_A": "A"
+  },
+  "raw_units": {
+    "q": "deg",
+    "current": "mA"
+  },
+  "method": {
+    "velocity": "central difference of q (rad) on the last row of each identical-timestamp batch, using measured timestamps",
+    "acceleration": "central difference of reconstructed velocity; boundary rows left NaN",
+    "smoothing_window_samples": 1,
+    "non_batch_last_rows": "derivatives NaN (true sample time unknown); raw values preserved",
+    "live_qddot": "ignored; not trusted as acceleration ground truth"
+  },
+  "rows": 899,
+  "derivative_rows": 563,
+  "parameters": {
+    "min_dt_s": 0.01,
+    "smoothing_window": 1,
+    "representative_policy": "last row of each identical-timestamp batch"
+  },
+  "exclusions": {
+    "rows_total": 899,
+    "not_batch_last_or_non_finite_time": 305,
+    "representative_rows": 594,
+    "representative_rows_without_valid_velocity": 31,
+    "representative_rows_without_valid_acceleration": 61
+  },
+  "limitations": "Times are host receive times, not sample times. Velocity is a candidate; acceleration is exploratory and must not be treated as physical ground truth. Unavailable values are NaN, never 0. Anomalies are not smoothed away unless smoothing_window>1 is requested and recorded here.",
+  "run_id": [
+    "RUN_06"
+  ],
+  "model_features": {
+    "A": "[1, qdot, tanh(qdot/v_s), sin(q), cos(q)]",
+    "B": "[1, qddot, qdot, tanh(qdot/v_s), sin(q), cos(q)]"
+  }
+}

@@ -21,6 +21,12 @@ from .robot_state import (
 
 logger = logging.getLogger(__name__)
 
+EXECEND_REASON_TEXT = {
+    "USER": "The program was stopped by the user.",
+    "PLC": "The program was stopped by the PLC interface.",
+    "ERROR": "The program was stopped by an external error (e.g. emergency stop).",
+}
+
 _STATUS_SEGMENTS = frozenset(
     {
         "MODE", "POSJOINTSETPOINT", "POSJOINTCURRENT", "POSCARTROBOT",
@@ -122,7 +128,19 @@ class CRIProtocolParser:
                     return None
 
             case "EXECEND":
-                return {"answer": "EXECEND"}
+                return self._parse_execend(parts[3:-1])
+
+            case "EXECACK":
+                return self._parse_exec_progress("EXECACK", parts[3:-1])
+
+            case "EXECPAUSE":
+                return self._parse_exec_progress("EXECPAUSE", parts[3:-1])
+
+            case "PROGACK":
+                return self._parse_progack(parts[3:-1])
+
+            case "PROGERROR":
+                return self._parse_progerror(parts[3:-1])
 
             case "EXECERROR":
                 return self._parse_execerror(parts[3:-1])
@@ -633,7 +651,60 @@ class CRIProtocolParser:
         else:
             return None
 
-    def _parse_execerror(self, parameters: Sequence[str]) -> dict[str, str]:
+    @staticmethod
+    def _int_or_none(value: str) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_progack(self, parameters: Sequence[str]) -> dict[str, Any]:
+        """`PROGACK ref_to_cCnt ref_to_cmdCnt`: answers the PROG command sent with that frame counter.
+
+        The frame counter (cCnt) selects the waiting event; the PROG command number (cmdCnt) is
+        returned separately so the sender can check that the right command was acknowledged.
+        """
+        if len(parameters) < 2:
+            return {"answer": parameters[0] if parameters else "PROGACK_INVALID"}
+        return {"answer": parameters[0], "prog_cmd": self._int_or_none(parameters[1])}
+
+    def _parse_progerror(self, parameters: Sequence[str]) -> dict[str, Any]:
+        """`PROGERROR ref_to_cCnt ref_to_cmdCnt errordescription`."""
+        if len(parameters) < 2:
+            return {"answer": parameters[0] if parameters else "PROGERROR_INVALID",
+                    "error": "malformed PROGERROR"}
+        description = " ".join(parameters[2:]) or "program command rejected"
+        return {"answer": parameters[0], "prog_cmd": self._int_or_none(parameters[1]),
+                "error": description}
+
+    def _parse_exec_progress(self, kind: str, parameters: Sequence[str]) -> dict[str, Any]:
+        """`EXECACK|EXECPAUSE cmdNr progNr`: the program command now being executed."""
+        notification: dict[str, Any] = {"answer": kind, "exec_event": kind}
+        if len(parameters) >= 2:
+            notification["cmd_nr"] = self._int_or_none(parameters[0])
+            notification["prog_nr"] = self._int_or_none(parameters[1])
+        return notification
+
+    def _parse_execend(self, parameters: Sequence[str]) -> dict[str, Any]:
+        """`EXECEND [cmdNr progNr reason]`.
+
+        Reason PLAN means the program finished as programmed. USER, PLC and ERROR are
+        reported as errors so no caller treats an interrupted run as a success. Messages
+        without a reason (plain Move completion) are reported as normal completion.
+        """
+        notification: dict[str, Any] = {"answer": "EXECEND", "exec_event": "EXECEND"}
+        if len(parameters) >= 2:
+            notification["cmd_nr"] = self._int_or_none(parameters[0])
+            notification["prog_nr"] = self._int_or_none(parameters[1])
+        if len(parameters) >= 3:
+            reason = parameters[2].upper()
+            notification["reason"] = reason
+            # Other reasons (e.g. MOVETO, sent when a single Move command completes) are normal.
+            if reason in EXECEND_REASON_TEXT:
+                notification["error"] = EXECEND_REASON_TEXT[reason]
+        return notification
+
+    def _parse_execerror(self, parameters: Sequence[str]) -> dict[str, Any]:
         """Parses a EXECERROR message to notify calling function
 
         Parameters
@@ -643,11 +714,17 @@ class CRIProtocolParser:
 
         Returns
         -------
-        dict[str, str]
+        dict
             A dict indicating which message id to notify (key: "answer") and the error message (key: "error")
         """
-
-        return {"answer": "EXECEND", "error": " ".join(parameters)}
+        notification: dict[str, Any] = {
+            "answer": "EXECEND", "exec_event": "EXECERROR", "reason": "ERROR",
+            "error": " ".join(parameters[2:]) if len(parameters) > 2 else " ".join(parameters),
+        }
+        if len(parameters) >= 2:
+            notification["cmd_nr"] = self._int_or_none(parameters[0])
+            notification["prog_nr"] = self._int_or_none(parameters[1])
+        return notification
 
     @staticmethod
     def _split_quotes_aware(msg: str) -> Sequence[str]:

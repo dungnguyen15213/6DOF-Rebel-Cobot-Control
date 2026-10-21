@@ -1,4 +1,7 @@
-﻿import time
+import math
+import time
+from core.kinematics import JOINT_LIMITS_DEG
+from core.path_planner import PathPlanner
 from cri_lib.cri_controller import CRIController
 from cri_lib.cri_errors import CRICommandTimeOutError
 
@@ -8,15 +11,14 @@ class RebelManager:
 
     DEFAULT_SUPPLY_VOLTAGE_MV = 24000
     WAYPOINT_TOLERANCE_DEG = 1.0
-    # The next waypoint is sent once the robot is this close to the current one, so the
-    # controller never decelerates to a stop between points.
-    WAYPOINT_BLEND_DEG = 2.0
-    PATH_ACCELERATION_PERCENT = 100.0
+    MIN_WAYPOINT_STEP_DEG = 0.01
+    FEEDBACK_MAX_AGE_SEC = 1.0
     WAYPOINT_REACH_TIMEOUT_SEC = 20.0
     WAYPOINT_POLL_SEC = 0.01
 
     def __init__(self):
         self.robot = CRIController()
+        self.simplify_tolerance_deg = 0.0
         self.last_connection_error: str | None = None
         self.current_jog_speeds = {
             "A1": 0.0, "A2": 0.0, "A3": 0.0, "A4": 0.0, "A5": 0.0, "A6": 0.0,
@@ -159,81 +161,129 @@ class RebelManager:
             self.robot.set_jog_values(**self.current_jog_speeds)
 
     def _joints_near(self, target, tolerance_deg):
-        """True when measured joints are within tolerance of target; None if feedback is unavailable."""
+        """True/False when fresh joint feedback is within tolerance of target; None if feedback is
+        unavailable, stale or non-finite (callers must treat None as NOT reached)."""
         try:
-            measured = [float(value) for value in self.get_joint_angles_list()]
+            robot = self.robot
+            received_at = getattr(robot, "last_status_received_at", None)
+            if received_at is not None and time.monotonic() - received_at > self.FEEDBACK_MAX_AGE_SEC:
+                return None
+            with robot.robot_state_lock:
+                joints = robot.robot_state.joints_current
+                measured = [float(v) for v in (joints.A1, joints.A2, joints.A3, joints.A4, joints.A5, joints.A6)]
+            if not all(math.isfinite(v) for v in measured):
+                return None
             return max(abs(m - float(t)) for m, t in zip(measured, target[:6])) <= tolerance_deg
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, AttributeError):
             return None
 
     def _wait_until_near(self, target, stop_event, tolerance_deg=None):
-        """Block until the robot is within tolerance of a waypoint, so the next move does not replace it early."""
-        tolerance_deg = self.WAYPOINT_BLEND_DEG if tolerance_deg is None else tolerance_deg
+        """Block until the robot is within tolerance of a waypoint; cancellation is checked first."""
+        tolerance_deg = self.WAYPOINT_TOLERANCE_DEG if tolerance_deg is None else tolerance_deg
         deadline = time.monotonic() + self.WAYPOINT_REACH_TIMEOUT_SEC
         while True:
-            near = self._joints_near(target, tolerance_deg)
-            if near is None or near:
-                return None
             if stop_event is not None and stop_event.is_set():
                 return "Execution stopped by user."
             if not self.robot.connected:
                 return "Robot disconnected during execution!"
+            near = self._joints_near(target, tolerance_deg)
+            if near:
+                return None
             if time.monotonic() > deadline:
+                if near is None:
+                    return "Joint feedback unavailable or stale; waypoint not confirmed."
                 return "Robot did not reach the waypoint in time."
             time.sleep(self.WAYPOINT_POLL_SEC)
 
-    def execute_path(self, path_data, velocity, stop_event=None):
-        """Send ordered targets one at a time, advancing as the robot reaches each waypoint.
-
-        A new CRI ``Move Joint`` replaces the move in progress, so streaming all points at a fixed
-        rate makes the robot skip straight to the last one. Each waypoint is therefore sent only
-        once the previous one has been reached (within ``WAYPOINT_TOLERANCE_DEG``); CRI keeps
-        profiling each move, and the final ``EXECEND`` confirms physical completion.
-        """
+    def validate_waypoints(self, path_data):
+        """Return (cleaned_path, error). Checks shape, finiteness and joint limits; keeps order."""
         if not path_data:
-            return False, "Empty path"
+            return None, "Empty path"
+        cleaned = []
+        for idx, point in enumerate(path_data):
+            try:
+                values = [float(v) for v in point]
+            except (TypeError, ValueError):
+                return None, f"Waypoint {idx} is not numeric."
+            if len(values) < 6 or not all(math.isfinite(v) for v in values[:6]):
+                return None, f"Waypoint {idx} needs 6 finite joint angles."
+            for j, (low, high) in enumerate(JOINT_LIMITS_DEG):
+                if not low <= values[j] <= high:
+                    return None, f"Waypoint {idx}: J{j + 1}={values[j]:.2f} deg is outside {low:.0f}..{high:.0f}."
+            cleaned.append(values[:6])
+        cleaned = PathPlanner.clean_path(cleaned, self.MIN_WAYPOINT_STEP_DEG, self.simplify_tolerance_deg)
+        return cleaned, None
+
+    def execute_path(self, path_data, velocity, acceleration=None, smoothing=None,
+                     stop_event=None, replace_loaded_program=False):
+        """Run the whole path as ONE controller-managed CRI joint program (velocity only by default).
+
+        All waypoints are buffered via ``PROG ... JOINT`` lines, ``CMD StartProgram`` is sent once
+        after every line is acknowledged, and success means ``EXECEND ... PLAN``. No ``Move Joint``
+        is ever sent here and there is no fallback: unsupported firmware is reported as an error.
+        ``acceleration``/``smoothing`` are optional and omitted from the PROG lines when None.
+        """
+        if not self.robot.connected:
+            return False, "Robot not connected"
+        cleaned, error = self.validate_waypoints(path_data)
+        if error:
+            return False, error
+        outcome = self.robot.run_joint_program(
+            cleaned, velocity, acceleration, smoothing,
+            replace_loaded_program=replace_loaded_program, stop_event=stop_event,
+        )
+        if outcome.success:
+            return True, None
+        return False, outcome.message or f"Program ended: {outcome.reason}"
+
+    def controller_has_loaded_program(self):
+        return self.robot.has_foreign_program_loaded()
+
+    def stop_execution(self):
+        """Stop an active CRI program (not just a Python flag)."""
+        try:
+            if not self.robot.connected:
+                return False
+            stopped = self.robot.stop_move()
+            return bool(self.robot.request_program_stop() or stopped)
+        except Exception:
+            return False
+
+    def execute_path_point_to_point(self, path_data, velocity, stop_event=None):
+        """Run the CSV waypoints in order using CRI ``Move Joint``, one point after another.
+
+        Each move is sent with ``wait_move_finished=True``: the CRI library waits for the
+        controller's EXECEND before the next waypoint is sent, so every point is reached and
+        no move is replaced by the following one. Motion between points is stopped/started
+        by the controller (not blended).
+        """
+        cleaned, error = self.validate_waypoints(path_data)
+        if error:
+            return False, error
         if not self.robot.connected:
             return False, "Robot not connected"
 
-        error_message = None
-        final_waypoint_index = len(path_data) - 1
-        accel = self.PATH_ACCELERATION_PERCENT
-        for idx, angles in enumerate(path_data):
+        for idx, angles in enumerate(cleaned):
             if stop_event is not None and stop_event.is_set():
-                error_message = "Execution stopped by user."
-                break
+                return False, "Execution stopped by user."
             if not self.robot.connected:
-                error_message = "Robot disconnected during execution!"
-                break
-
+                return False, "Robot disconnected during execution!"
             try:
-                move_args = dict(
+                success = self.robot.move_joints(
                     A1=angles[0], A2=angles[1], A3=angles[2],
                     A4=angles[3], A5=angles[4], A6=angles[5],
                     E1=0.0, E2=0.0, E3=0.0,
                     velocity=velocity,
-                    wait_move_finished=idx == final_waypoint_index,
+                    wait_move_finished=True,
                     move_finished_timeout=60.0,
                 )
-                success = self.robot.move_joints(acceleration=accel, **move_args)
-                if not success and idx == 0 and accel is not None:
-                    # Older controller firmware rejects the acceleration argument.
-                    accel = None
-                    success = self.robot.move_joints(**move_args)
             except CRICommandTimeOutError:
-                error_message = f"Timed out sending waypoint {idx}."
-                break
+                return False, f"Timed out on waypoint {idx + 1}/{len(cleaned)}."
             except Exception as e:
-                error_message = f"Error sending waypoint {idx}: {e}"
-                break
+                return False, f"Error on waypoint {idx + 1}/{len(cleaned)}: {e}"
             if not success:
+                if stop_event is not None and stop_event.is_set():
+                    return False, "Execution stopped by user."
                 detail = getattr(self.robot, "last_move_error", "")
-                error_message = f"Failed to execute waypoint {idx}." + (f" {detail}" if isinstance(detail, str) and detail else "")
-                break
-            if idx != final_waypoint_index:
-                error_message = self._wait_until_near(angles, stop_event)
-                if error_message:
-                    error_message = f"Waypoint {idx}: {error_message}"
-                    break
-
-        return error_message is None, error_message
+                return False, f"Waypoint {idx + 1}/{len(cleaned)} failed." + (f" {detail}" if isinstance(detail, str) and detail else "")
+        return True, None

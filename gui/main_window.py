@@ -4,7 +4,7 @@ import time
 import logging
 import threading
 from pathlib import Path
-from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
+from PyQt6.QtWidgets import (QSizePolicy, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
                              QGroupBox, QLabel, QPushButton, QLineEdit, QMessageBox,
                              QComboBox, QDoubleSpinBox, QDialog, QSpinBox, QFileDialog, QSlider, QScrollArea, QTabWidget, QCheckBox,
                              QFormLayout, QDialogButtonBox)
@@ -577,6 +577,8 @@ class MainWindow(QMainWindow):
         trajectory_layout = QGridLayout(trajectory_group)
         self.cmb_trajectory_files = QComboBox()
         self.cmb_trajectory_files.setEditable(False)
+        self.cmb_trajectory_files.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.cmb_trajectory_files.setMinimumContentsLength(8)
         self.btn_load_trajectory = QPushButton("Load CSV")
         self.btn_load_trajectory.clicked.connect(self.load_selected_trajectory)
         self.btn_browse_trajectory = QPushButton("Browse...")
@@ -586,7 +588,10 @@ class MainWindow(QMainWindow):
         self.lbl_loaded_start = QLabel("Start: --")
         self.lbl_loaded_target = QLabel("Target: --")
         self.lbl_trajectory_status = QLabel("Validation: pending")
-
+        for label in (self.lbl_loaded_trajectory, self.lbl_loaded_waypoints, self.lbl_loaded_start,
+                      self.lbl_loaded_target, self.lbl_trajectory_status):
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         trajectory_layout.addWidget(QLabel("Saved pathway:"), 0, 0)
         trajectory_layout.addWidget(self.cmb_trajectory_files, 0, 1, 1, 2)
         trajectory_layout.addWidget(self.btn_load_trajectory, 1, 1)
@@ -600,20 +605,24 @@ class MainWindow(QMainWindow):
         trajectory_layout.setVerticalSpacing(4)
         execution_layout.addWidget(trajectory_group)
 
-        run_settings_layout = QHBoxLayout()
+        run_settings_layout = QGridLayout()
         self.spin_robot_velocity = QDoubleSpinBox()
         self.spin_robot_velocity.setRange(1.0, 100.0)
         self.spin_robot_velocity.setValue(50.0)
         self.spin_robot_velocity.setDecimals(0)
         self.spin_robot_velocity.setSuffix(" %")
         self.spin_robot_velocity.setToolTip("CRI velocity used for preparation and task motion")
-        run_settings_layout.addWidget(QLabel("Motion speed:"))
-        run_settings_layout.addWidget(self.spin_robot_velocity)
+        run_settings_layout.addWidget(QLabel("Speed"), 0, 0)
+        run_settings_layout.addWidget(self.spin_robot_velocity, 1, 0)
         self.btn_execute_path = QPushButton("Run")
         self.btn_execute_path.setStyleSheet("background-color: #c0392b; color: white; padding: 6px; font-weight: bold;")
         self.btn_execute_path.setEnabled(False)
         self.btn_execute_path.clicked.connect(self.execute_path)
-        run_settings_layout.addWidget(self.btn_execute_path, 1)
+        run_settings_layout.addWidget(self.btn_execute_path, 1, 1)
+        self.btn_stop_execution = QPushButton("Stop")
+        self.btn_stop_execution.setStyleSheet("background-color: #7f8c8d; color: white; padding: 6px; font-weight: bold;")
+        self.btn_stop_execution.clicked.connect(self.stop_execution)
+        run_settings_layout.addWidget(self.btn_stop_execution, 1, 2)
         execution_layout.addLayout(run_settings_layout)
 
         identification_tab = QWidget()
@@ -1812,11 +1821,25 @@ class MainWindow(QMainWindow):
         try:
             velocity = self._execution_motion_speed()
             num_waypoints = len(task_path)
-            
+
+            replace_program = False
+            if self.manager.controller_has_loaded_program():
+                answer = QMessageBox.question(
+                    self, "Replace Controller Program?",
+                    "The controller already has a robot program loaded. Running this trajectory will "
+                    "delete it from the controller (not from disk).\n\nReplace it?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if answer != QMessageBox.StandardButton.Yes:
+                    return
+                replace_program = True
+
             # Confirm execution
             reply = QMessageBox.question(
                 self, "Run Trajectory",
-                f"Move to the trajectory start pose, then run {num_waypoints} waypoints at {velocity:.0f}% velocity?",
+                f"Move to the trajectory start pose, then run {num_waypoints} waypoints as one controller-managed CRI program "
+                f"at {velocity:.0f}% velocity?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             
@@ -1847,7 +1870,7 @@ class MainWindow(QMainWindow):
             print(f"Starting trajectory execution with preparation to {start_angles} and {num_waypoints} task waypoints...")
             self.execution_thread = threading.Thread(
                 target=self._execute_path_worker,
-                args=(list(start_angles), task_path, velocity),
+                args=(list(start_angles), task_path, velocity, replace_program),
                 daemon=True,
             )
             self.execution_thread.start()
@@ -1857,7 +1880,13 @@ class MainWindow(QMainWindow):
             self.btn_move_to_start.setEnabled(True)
             self.btn_execute_path.setEnabled(bool(self.loaded_trajectory_plan) and self.manager.robot.connected)
 
-    def _execute_path_worker(self, start_angles, task_path, velocity):
+    def stop_execution(self):
+        """Stop the running trajectory: set the cancel flag and stop the CRI program on the controller."""
+        self.execution_stop_event.set()
+        if self.manager.robot.connected:
+            threading.Thread(target=self.manager.stop_execution, daemon=True).start()
+
+    def _execute_path_worker(self, start_angles, task_path, velocity, replace_program=False):
         error_message = None
         self.execution_error = None
         self.execution_complete = False
@@ -1897,6 +1926,7 @@ class MainWindow(QMainWindow):
                 task_path,
                 float(velocity),
                 stop_event=self.execution_stop_event,
+                replace_loaded_program=replace_program,
             )
             self.execution_elapsed = max(0.0, time.monotonic() - task_start)
             if not success:

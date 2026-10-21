@@ -1,0 +1,746 @@
+{
+  "run_id": "identification_ID_NORMAL_006_trajectory_export_RUN_06_20261022T002058",
+  "generated_utc": "2026-10-21T17:21:22.789970+00:00",
+  "source_file": "identification_data\\identification_ID_NORMAL_006_trajectory_export_RUN_06_20261022T002058.csv",
+  "source_sha256": "715e0499da4c07fb0d1946380719f33da3d2204c16b757ce6f5ef5a36d3f1cc1",
+  "decisions": {
+    "structure_and_metadata": {
+      "status": "PASS",
+      "reason": "columns, rows and metadata valid"
+    },
+    "raw_positions": {
+      "status": "PASS",
+      "reason": "all q finite (a constant joint is not a failure)"
+    },
+    "raw_current": {
+      "status": "WARNING",
+      "reason": "constant/zero channels present (stationary or unverified; genuine zeros are not a failure)"
+    },
+    "current_freshness": {
+      "status": "PASS",
+      "reason": "every row has FRESH current and position from its own STATUS message",
+      "evidence": {
+        "counts": {
+          "position": {
+            "FRESH": 899,
+            "MISSING": 0,
+            "NON_FINITE": 0,
+            "UNKNOWN": 0
+          },
+          "current": {
+            "FRESH": 899,
+            "MISSING": 0,
+            "NON_FINITE": 0,
+            "UNKNOWN": 0
+          }
+        },
+        "rule": "FRESH = field present in the same STATUS and finite; a measured 0 is FRESH"
+      }
+    },
+    "status_frame_accounting": {
+      "status": "PASS",
+      "reason": "STATUS frames received during the run equal rows written; other frame types are not data loss",
+      "evidence": {
+        "status_counter_contiguous": true,
+        "rows": 899,
+        "status_frames_received": 899,
+        "discarded_frames_delta": 0,
+        "parse_errors_delta": 0,
+        "callback_errors_delta": 0,
+        "other_frame_types_ignored_here": true
+      }
+    },
+    "logger_integrity": {
+      "status": "PASS",
+      "reason": "no writer drops or errors reported"
+    },
+    "receive_timing": {
+      "status": "WARNING",
+      "reason": "host receive time only; STATUS carries no device timestamp; batched rows share a timestamp (labelled, not repaired)"
+    },
+    "derived_velocity": {
+      "status": "WARNING",
+      "reason": "finite differences use host receive intervals >= 10 ms; velocity noise unquantified"
+    },
+    "derived_acceleration": {
+      "status": "FAIL",
+      "reason": "receive-interval CV=0.29, fraction<min dt=0.03: acceleration from receive times is unreliable"
+    },
+    "model_a_exploratory": {
+      "status": "WARNING",
+      "reason": "offline exploration only: position/velocity features on time-valid rows; not final training data"
+    },
+    "model_b": {
+      "status": "FAIL",
+      "reason": "acceleration regressor unreliable with this timing"
+    },
+    "excitation": {
+      "status": "FAIL",
+      "reason": "excited joints []; not fully excited [1, 2, 3, 4, 5, 6]"
+    },
+    "overall_readiness": "CONDITIONALLY READY"
+  },
+  "timing": {
+    "rows": 899,
+    "unique_timestamps": 594,
+    "rows_sharing_timestamp": 305,
+    "unique_chunks": 594,
+    "timing_class_counts": {
+      "UNIQUE": 289,
+      "BATCH_EARLIER": 305,
+      "BATCH_LAST": 305
+    },
+    "chunk_dt_s": {
+      "min": 0.0004794999986188486,
+      "median": 0.04587380000157282,
+      "max": 0.07110419999662554,
+      "mean": 0.041252861045526036,
+      "cv": 0.2901920380088886,
+      "fraction_below_min_dt": 0.025295109612141653
+    },
+    "frame_counter": {
+      "first": 3275,
+      "last": 4451,
+      "span": 1177,
+      "rows": 899,
+      "max_gap": 6,
+      "gaps_gt1": 182,
+      "non_increasing": 0
+    },
+    "status_frame_counter": {
+      "first": 2469,
+      "last": 3367,
+      "span": 899,
+      "rows": 899,
+      "max_gap": 1,
+      "gaps_gt1": 0,
+      "non_increasing": 0
+    }
+  },
+  "current_freshness": {
+    "J1": {
+      "finite": 899,
+      "exact_zero": 0,
+      "value_changes": 0,
+      "unique_values": 1
+    },
+    "J2": {
+      "finite": 899,
+      "exact_zero": 0,
+      "value_changes": 337,
+      "unique_values": 21
+    },
+    "J3": {
+      "finite": 899,
+      "exact_zero": 0,
+      "value_changes": 0,
+      "unique_values": 1
+    },
+    "J4": {
+      "finite": 899,
+      "exact_zero": 899,
+      "value_changes": 0,
+      "unique_values": 1
+    },
+    "J5": {
+      "finite": 899,
+      "exact_zero": 0,
+      "value_changes": 0,
+      "unique_values": 1
+    },
+    "J6": {
+      "finite": 899,
+      "exact_zero": 0,
+      "value_changes": 228,
+      "unique_values": 4
+    }
+  },
+  "audit_overall_status": "WARNING",
+  "audit": {
+    "schema_version": 1,
+    "source_file": "identification_data\\identification_ID_NORMAL_006_trajectory_export_RUN_06_20261022T002058.csv",
+    "source_sha256": "715e0499da4c07fb0d1946380719f33da3d2204c16b757ce6f5ef5a36d3f1cc1",
+    "source_size_bytes": 223701,
+    "config": {
+      "expected_payload_g": 0.0,
+      "expected_contact_label": "NORMAL",
+      "expected_grasp_context": "NONE",
+      "gap_factor": 5.0,
+      "duplicate_timestamp_fail_fraction": 0.05,
+      "motion_threshold_deg_s": 1.0,
+      "min_motion_range_deg": 1.0,
+      "min_excitation_range_deg": 5.0,
+      "min_direction_travel_deg": 2.0,
+      "frozen_run_fraction": 0.5,
+      "plateau_min_samples": 5,
+      "multi_zero_channels": 3,
+      "min_dry_duration_s": 10.0,
+      "min_full_duration_s": 30.0
+    },
+    "units": {
+      "timestamp": "s, host monotonic clock at CRI socket receive (not robot sample time)",
+      "q": "deg",
+      "qdot": "deg/s",
+      "qddot": "deg/s^2",
+      "current": "mA"
+    },
+    "criteria": [
+      {
+        "id": "R1",
+        "name": "CSV parses and has data rows",
+        "status": "PASS",
+        "evidence": "899 data rows"
+      },
+      {
+        "id": "R2",
+        "name": "Required columns present",
+        "status": "PASS",
+        "evidence": "all required columns present"
+      },
+      {
+        "id": "R3",
+        "name": "No malformed or truncated rows",
+        "status": "PASS",
+        "evidence": {
+          "malformed_rows": 0,
+          "final_line_terminated": true
+        }
+      },
+      {
+        "id": "I1",
+        "name": "Metadata constant for the whole run",
+        "status": "PASS",
+        "evidence": {
+          "inconsistent": {},
+          "empty_fields": [],
+          "values": {
+            "experiment_id": [
+              "ID_NORMAL_006"
+            ],
+            "trajectory_id": [
+              "trajectory_export"
+            ],
+            "run_id": [
+              "RUN_06"
+            ],
+            "commanded_speed": [
+              "50.0"
+            ],
+            "payload_g": [
+              "0.0"
+            ],
+            "contact_label": [
+              "NORMAL"
+            ],
+            "grasp_context": [
+              "NONE"
+            ],
+            "thermal_condition": [
+              "COLD"
+            ]
+          }
+        }
+      },
+      {
+        "id": "I2",
+        "name": "Experiment conditions match configured expectation",
+        "status": "PASS",
+        "evidence": {
+          "expected": {
+            "payload_g": 0.0,
+            "contact_label": "NORMAL",
+            "grasp_context": "NONE"
+          },
+          "mismatches": {}
+        }
+      },
+      {
+        "id": "I3",
+        "name": "Thermal condition declared",
+        "status": "PASS",
+        "evidence": {
+          "reported": [
+            "COLD"
+          ],
+          "note": "operator-declared label; no temperature signal is verified by this audit"
+        }
+      },
+      {
+        "id": "I4",
+        "name": "q and current are finite for every row",
+        "status": "PASS",
+        "evidence": {
+          "bad_columns": {},
+          "timestamp_issues": {
+            "missing": 0,
+            "nonfinite": 0,
+            "invalid": 0
+          }
+        }
+      },
+      {
+        "id": "I8",
+        "name": "Explicit per-row freshness of position and current telemetry",
+        "status": "PASS",
+        "evidence": {
+          "counts": {
+            "position": {
+              "FRESH": 899,
+              "MISSING": 0,
+              "NON_FINITE": 0,
+              "UNKNOWN": 0
+            },
+            "current": {
+              "FRESH": 899,
+              "MISSING": 0,
+              "NON_FINITE": 0,
+              "UNKNOWN": 0
+            }
+          },
+          "rule": "FRESH = field present in the same STATUS and finite; a measured 0 is FRESH"
+        }
+      },
+      {
+        "id": "I5",
+        "name": "Current telemetry is fresh (no initialized or partially zeroed rows)",
+        "status": "PASS",
+        "evidence": {
+          "all_zero_rows": 0,
+          "leading_all_zero_rows": 0,
+          "rows_with_many_zero_channels": 0,
+          "many_zero_channel_threshold": 3,
+          "first_last_such_row": null,
+          "rule": "leading all-zero rows match RobotState zero initialization; simultaneous exact zeros on several channels cannot be separated from genuine idle current using the CSV alone"
+        }
+      },
+      {
+        "id": "I6",
+        "name": "No flat, frozen, or all-zero current channel",
+        "status": "WARNING",
+        "evidence": {
+          "current1": [
+            "constant",
+            "identical run of 899/899 samples"
+          ],
+          "current3": [
+            "constant",
+            "identical run of 899/899 samples"
+          ],
+          "current4": [
+            "constant",
+            "identical run of 899/899 samples",
+            "all zero"
+          ],
+          "current5": [
+            "constant",
+            "identical run of 899/899 samples"
+          ]
+        }
+      },
+      {
+        "id": "I7",
+        "name": "Current clipping",
+        "status": "NOT VERIFIED",
+        "evidence": {
+          "note": "no documented current limit; extremum repeats are reported, not judged",
+          "repeated_extrema": {
+            "current1": {
+              "samples_at_max": 899,
+              "samples_at_min": 899,
+              "min_mA": 19.0,
+              "max_mA": 19.0
+            },
+            "current3": {
+              "samples_at_max": 899,
+              "samples_at_min": 899,
+              "min_mA": 361.0,
+              "max_mA": 361.0
+            },
+            "current4": {
+              "samples_at_max": 899,
+              "samples_at_min": 899,
+              "min_mA": 0.0,
+              "max_mA": 0.0
+            },
+            "current5": {
+              "samples_at_max": 899,
+              "samples_at_min": 899,
+              "min_mA": 9.0,
+              "max_mA": 9.0
+            },
+            "current6": {
+              "samples_at_max": 764,
+              "samples_at_min": 2,
+              "min_mA": 36.0,
+              "max_mA": 39.0
+            }
+          }
+        }
+      },
+      {
+        "id": "T1",
+        "name": "Timestamps never decrease",
+        "status": "PASS",
+        "evidence": {
+          "negative_dt": 0
+        }
+      },
+      {
+        "id": "T2",
+        "name": "Timestamps are unique (one STATUS per host timestamp)",
+        "status": "WARNING",
+        "evidence": {
+          "timing_provenance": "present",
+          "label_counts": {
+            "BATCH_EARLIER": 305,
+            "BATCH_LAST": 305,
+            "UNIQUE": 289
+          },
+          "labels_inconsistent_with_timestamps": 0,
+          "usable_rows_with_nonincreasing_timestamp": 0,
+          "dt_zero_count": 305,
+          "note": "batched rows are labelled; derivatives use only UNIQUE/BATCH_LAST rows. True sample times inside a batch are unknown and not reconstructed."
+        }
+      },
+      {
+        "id": "T3",
+        "name": "No unexpected recording gaps",
+        "status": "PASS",
+        "evidence": {
+          "gap_count": 0,
+          "gap_limit_s": 0.22941949999221833,
+          "largest_gap_s": null
+        }
+      },
+      {
+        "id": "T4",
+        "name": "sample_index is contiguous",
+        "status": "PASS",
+        "evidence": {
+          "discontinuities": 0
+        }
+      },
+      {
+        "id": "T5",
+        "name": "Effective sampling rate measured",
+        "status": "PASS",
+        "evidence": {
+          "rows": 899,
+          "duration_s": 24.46297819999745,
+          "message_rate_hz": 36.70853126133651,
+          "unique_timestamp_rate_hz": 24.24071162357745,
+          "unique_timestamp_count": 594
+        }
+      },
+      {
+        "id": "L2",
+        "name": "All received STATUS frames are accounted for",
+        "status": "PASS",
+        "evidence": {
+          "status_counter_contiguous": true,
+          "rows": 899,
+          "status_frames_received": 899,
+          "discarded_frames_delta": 0,
+          "parse_errors_delta": 0,
+          "callback_errors_delta": 0,
+          "other_frame_types_ignored_here": true
+        }
+      },
+      {
+        "id": "L1",
+        "name": "Logger writer reported no drops or errors",
+        "status": "PASS",
+        "evidence": {
+          "dropped": 0,
+          "writer_error": null,
+          "logger_quality_status": "WARNING"
+        }
+      }
+    ],
+    "timing": {
+      "message_dt_s": {
+        "min": 0.0,
+        "median": 0.03905379999559955,
+        "mean": 0.02724162383073213,
+        "p95": 0.051751890004015866,
+        "p99": 0.05718219900081748,
+        "max": 0.07098689999838825,
+        "std": 0.021823507818762362
+      },
+      "unique_timestamp_dt_s": {
+        "min": 0.0005171000011614524,
+        "median": 0.04588389999844367,
+        "mean": 0.041252914333891146,
+        "p95": 0.05355311999883269,
+        "p99": 0.05833906800195112,
+        "max": 0.07098689999838825,
+        "std": 0.011967389574518768
+      },
+      "gap_limit_s": 0.22941949999221833,
+      "gap_count": 0,
+      "largest_gap_s": null,
+      "dt_histogram_unique": {
+        "counts": [
+          10,
+          18,
+          41,
+          34,
+          21,
+          69,
+          323,
+          67,
+          9,
+          1
+        ],
+        "edges_s": [
+          0.0005171000011614524,
+          0.007564080000884132,
+          0.014611060000606812,
+          0.02165804000032949,
+          0.02870502000005217,
+          0.03575199999977485,
+          0.04279897999949753,
+          0.04984595999922021,
+          0.05689293999894289,
+          0.06393991999866556,
+          0.07098689999838825
+        ]
+      }
+    },
+    "sampling": {
+      "rows": 899,
+      "duration_s": 24.46297819999745,
+      "message_rate_hz": 36.70853126133651,
+      "unique_timestamp_rate_hz": 24.24071162357745,
+      "unique_timestamp_count": 594
+    },
+    "joints": [
+      {
+        "joint": 1,
+        "q_min_deg": -0.0,
+        "q_max_deg": -0.0,
+        "q_range_deg": 0.0,
+        "travel_positive_deg": 0.0,
+        "travel_negative_deg": -0.0,
+        "bidirectional": false,
+        "speed_min_deg_s": 0.0,
+        "speed_max_deg_s": 0.0,
+        "moving_fraction": 0.0,
+        "current_min_mA": 19.0,
+        "current_max_mA": 19.0,
+        "current_mean_mA": 19.0,
+        "current_std_mA": 0.0,
+        "current_unique_values": 1,
+        "current_moving_mean_mA": null,
+        "current_moving_std_mA": null,
+        "current_stationary_mean_mA": 19.0,
+        "current_stationary_std_mA": 0.0,
+        "longest_identical_current_run": 899,
+        "samples_at_current_max": 899,
+        "samples_at_current_min": 899,
+        "excitation": "NOT EXERCISED"
+      },
+      {
+        "joint": 2,
+        "q_min_deg": 0.01,
+        "q_max_deg": 0.01,
+        "q_range_deg": 0.0,
+        "travel_positive_deg": 0.0,
+        "travel_negative_deg": -0.0,
+        "bidirectional": false,
+        "speed_min_deg_s": 0.0,
+        "speed_max_deg_s": 0.0,
+        "moving_fraction": 0.0,
+        "current_min_mA": 38.0,
+        "current_max_mA": 188.0,
+        "current_mean_mA": 68.92769744160178,
+        "current_std_mA": 27.285380544760933,
+        "current_unique_values": 21,
+        "current_moving_mean_mA": null,
+        "current_moving_std_mA": null,
+        "current_stationary_mean_mA": 68.69983136593592,
+        "current_stationary_std_mA": 27.17144896936241,
+        "longest_identical_current_run": 207,
+        "samples_at_current_max": 1,
+        "samples_at_current_min": 2,
+        "excitation": "NOT EXERCISED"
+      },
+      {
+        "joint": 3,
+        "q_min_deg": 90.0,
+        "q_max_deg": 90.0,
+        "q_range_deg": 0.0,
+        "travel_positive_deg": 0.0,
+        "travel_negative_deg": -0.0,
+        "bidirectional": false,
+        "speed_min_deg_s": 0.0,
+        "speed_max_deg_s": 0.0,
+        "moving_fraction": 0.0,
+        "current_min_mA": 361.0,
+        "current_max_mA": 361.0,
+        "current_mean_mA": 361.0,
+        "current_std_mA": 0.0,
+        "current_unique_values": 1,
+        "current_moving_mean_mA": null,
+        "current_moving_std_mA": null,
+        "current_stationary_mean_mA": 361.0,
+        "current_stationary_std_mA": 0.0,
+        "longest_identical_current_run": 899,
+        "samples_at_current_max": 899,
+        "samples_at_current_min": 899,
+        "excitation": "NOT EXERCISED"
+      },
+      {
+        "joint": 4,
+        "q_min_deg": -0.0,
+        "q_max_deg": -0.0,
+        "q_range_deg": 0.0,
+        "travel_positive_deg": 0.0,
+        "travel_negative_deg": -0.0,
+        "bidirectional": false,
+        "speed_min_deg_s": 0.0,
+        "speed_max_deg_s": 0.0,
+        "moving_fraction": 0.0,
+        "current_min_mA": 0.0,
+        "current_max_mA": 0.0,
+        "current_mean_mA": 0.0,
+        "current_std_mA": 0.0,
+        "current_unique_values": 1,
+        "current_moving_mean_mA": null,
+        "current_moving_std_mA": null,
+        "current_stationary_mean_mA": 0.0,
+        "current_stationary_std_mA": 0.0,
+        "longest_identical_current_run": 899,
+        "samples_at_current_max": 899,
+        "samples_at_current_min": 899,
+        "excitation": "NOT EXERCISED"
+      },
+      {
+        "joint": 5,
+        "q_min_deg": 90.0,
+        "q_max_deg": 90.0,
+        "q_range_deg": 0.0,
+        "travel_positive_deg": 0.0,
+        "travel_negative_deg": -0.0,
+        "bidirectional": false,
+        "speed_min_deg_s": 0.0,
+        "speed_max_deg_s": 0.0,
+        "moving_fraction": 0.0,
+        "current_min_mA": 9.0,
+        "current_max_mA": 9.0,
+        "current_mean_mA": 9.0,
+        "current_std_mA": 0.0,
+        "current_unique_values": 1,
+        "current_moving_mean_mA": null,
+        "current_moving_std_mA": null,
+        "current_stationary_mean_mA": 9.0,
+        "current_stationary_std_mA": 0.0,
+        "longest_identical_current_run": 899,
+        "samples_at_current_max": 899,
+        "samples_at_current_min": 899,
+        "excitation": "NOT EXERCISED"
+      },
+      {
+        "joint": 6,
+        "q_min_deg": -0.0,
+        "q_max_deg": -0.0,
+        "q_range_deg": 0.0,
+        "travel_positive_deg": 0.0,
+        "travel_negative_deg": -0.0,
+        "bidirectional": false,
+        "speed_min_deg_s": 0.0,
+        "speed_max_deg_s": 0.0,
+        "moving_fraction": 0.0,
+        "current_min_mA": 36.0,
+        "current_max_mA": 39.0,
+        "current_mean_mA": 38.827586206896555,
+        "current_std_mA": 0.43775626477694557,
+        "current_unique_values": 4,
+        "current_moving_mean_mA": null,
+        "current_moving_std_mA": null,
+        "current_stationary_mean_mA": 38.822934232715006,
+        "current_stationary_std_mA": 0.4430617344852205,
+        "longest_identical_current_run": 32,
+        "samples_at_current_max": 764,
+        "samples_at_current_min": 2,
+        "excitation": "NOT EXERCISED"
+      }
+    ],
+    "excitation_summary": {
+      "status": "FAIL",
+      "excited_joints": [],
+      "not_fully_excited_joints": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6
+      ]
+    },
+    "batch_duplicate_rows": 305,
+    "conclusions": {
+      "basic_csv_readability": "PASS",
+      "logger_signal_integrity": "WARNING",
+      "initial_0g_dry_test": "WARNING",
+      "full_six_joint_campaign": "WARNING"
+    },
+    "overall_status": "WARNING",
+    "data_use": "logger dry test only",
+    "not_verified": [
+      "I7"
+    ],
+    "campaign_note": "A single run never certifies the identification campaign; the plan requires 10-15 trajectory recipes with independent repeats."
+  },
+  "sidecar_frame_accounting": {
+    "start": {
+      "connection_epoch": 1,
+      "frames_total": 3275,
+      "status_frames": 2469,
+      "frame_type_counts": {
+        "CMD": 5,
+        "MESSAGE": 5,
+        "STATUS": 2469,
+        "OPINFO": 25,
+        "VARIABLES": 124,
+        "LOGMSG": 56,
+        "RUNSTATE": 354,
+        "GRIPPERSTATE": 118,
+        "CYCLESTAT": 117,
+        "CMDACK": 2
+      },
+      "discarded_frames": 0,
+      "parse_errors": 0,
+      "status_callbacks": 2469,
+      "status_callback_errors": 0
+    },
+    "end": {
+      "connection_epoch": 1,
+      "frames_total": 4452,
+      "status_frames": 3368,
+      "frame_type_counts": {
+        "CMD": 5,
+        "MESSAGE": 5,
+        "STATUS": 3368,
+        "OPINFO": 34,
+        "VARIABLES": 169,
+        "LOGMSG": 66,
+        "RUNSTATE": 483,
+        "GRIPPERSTATE": 160,
+        "CYCLESTAT": 160,
+        "CMDACK": 2
+      },
+      "discarded_frames": 0,
+      "parse_errors": 0,
+      "status_callbacks": 3368,
+      "status_callback_errors": 0
+    }
+  },
+  "sidecar_logger_accounting": {
+    "samples_offered_to_logger": 899,
+    "samples_with_complete_q": 899,
+    "samples_with_complete_current": 899,
+    "rows_written": 899,
+    "dropped_by_queue_or_writer": 0
+  }
+}

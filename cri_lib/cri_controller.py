@@ -1,4 +1,6 @@
 import logging
+import math
+import re
 import socket
 import threading
 from datetime import datetime, timezone
@@ -6,13 +8,14 @@ from enum import Enum
 from pathlib import Path
 from queue import Empty, Queue
 from time import perf_counter, sleep, time
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from core.latency_tracking import NetworkLatencyTracker
 from .cri_errors import CRICommandTimeOutError, CRIConnectionError
 from .cri_protocol_parser import CRIProtocolParser
 from .frame_timing import FrameTimer, FrameTiming, extract_frames, message_type
-from .robot_state import KinematicsState, RobotState
+from .program_execution import ProgramExecution, ProgramOutcome
+from .robot_state import KinematicsState, RobotState, RunState
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +58,7 @@ class CRIController:
 
         self.frame_timer = FrameTimer()
         self.last_status_timing: FrameTiming | None = None
+        self.last_status_received_at: float | None = None
 
         self.jog_thread = threading.Thread(target=self._bg_alivejog_thread, daemon=True)
         self.receive_thread = threading.Thread(
@@ -66,6 +70,9 @@ class CRIController:
         self.answer_events_lock = threading.Lock()
         self.answer_events: dict[str, threading.Event] = {}
         self.error_messages: dict[str, str] = {}
+        self.prog_ack_commands: dict[str, int] = {}
+        self.program_execution = ProgramExecution()
+        self._temporary_program_loaded = False
         self.network_latency = NetworkLatencyTracker()
         self.command_sent_callback: Callable[[str, str, float], None] | None = None
 
@@ -388,6 +395,7 @@ class CRIController:
             if answer_id == "status":
                 # Valid only inside the status callback, which runs in this thread.
                 self.last_status_timing = timing
+                self.last_status_received_at = received_at
             if answer_id == "status" and self.status_callback is not None:
                 try:
                     self.frame_timer.status_callbacks += 1
@@ -407,10 +415,15 @@ class CRIController:
             if answer_id == "CAN":
                 self.can_queue.put_nowait(notification["can"])
 
+            if notification.get("exec_event") is not None:
+                self.program_execution.handle(notification)
+
             with self.answer_events_lock:
                 msg_id = notification["answer"]
 
                 if msg_id in self.answer_events:
+                    if (prog_cmd := notification.get("prog_cmd")) is not None:
+                        self.prog_ack_commands[msg_id] = prog_cmd
                     if (error_msg := notification.get("error", None)) is not None:
                         self.error_messages[msg_id] = error_msg
 
@@ -1267,6 +1280,225 @@ class CRIController:
             return False
         else:
             return True
+
+    # ------------------------------------------------------------------
+    # Controller-side robot programs (CRI "PROG" commands, V17 sections 4.8/4.9)
+    # ------------------------------------------------------------------
+
+    PROGRAM_ACK_TIMEOUT = 5.0
+    PROGRAM_STOP_GRACE_SEC = 5.0
+    MIN_SMOOTHING_IRC_VERSION = 14
+    MAX_LEGACY_VERSION_NUMBER = 99
+
+    @staticmethod
+    def build_prog_joint_command(
+        command_number: int,
+        joints: Sequence[float],
+        velocity: float,
+        acceleration: float | None = None,
+        smoothing: float | None = None,
+        external: Sequence[float] = (0.0, 0.0, 0.0),
+    ) -> str:
+        """Wire text (without CRISTART/counter/CRIEND) of one `PROG ... JOINT` command.
+
+        `PROG <cmdCnt> JOINT a1..a6 EXT e1 e2 e3 VEL v [ACC a] [SM s]`. The command number
+        `cmdCnt` is the program line, independent of the CRI frame counter.
+        """
+        if len(joints) != 6 or len(external) != 3:
+            raise ValueError("A program joint command needs 6 joint and 3 external values.")
+        values = [float(v) for v in (*joints, *external, velocity)]
+        optional = [v for v in (acceleration, smoothing) if v is not None]
+        if not all(math.isfinite(v) for v in values + [float(v) for v in optional]):
+            raise ValueError("Program values must be finite numbers.")
+        if not 0.0 < float(velocity) <= 100.0:
+            raise ValueError("Velocity must be within (0, 100] percent.")
+        if acceleration is not None and not 0.0 < float(acceleration) <= 100.0:
+            raise ValueError("Acceleration must be within (0, 100] percent.")
+        if smoothing is not None and not 0.0 <= float(smoothing) <= 100.0:
+            raise ValueError("Smoothing must be within [0, 100] percent.")
+        text = " ".join(f"{v:.4f}" for v in values[:6])
+        text += " EXT " + " ".join(f"{v:.4f}" for v in values[6:9])
+        text += f" VEL {values[9]:.2f}"
+        if acceleration is not None:
+            text += f" ACC {float(acceleration):.2f}"
+        if smoothing is not None:
+            text += f" SM {float(smoothing):.2f}"
+        return f"PROG {int(command_number)} JOINT {text}"
+
+    def _command_with_ack(self, command: str, timeout: float | None = None) -> tuple[int, str | None]:
+        """Send a command and wait for its CMDACK/PROGACK. Returns (frame counter, error or None).
+
+        Raises CRICommandTimeOutError (after dropping the pending event) when no answer arrives.
+        """
+        msg_id = self._send_command(command, True)
+        try:
+            return msg_id, self._wait_for_answer(
+                msg_id, timeout=self.PROGRAM_ACK_TIMEOUT if timeout is None else timeout
+            )
+        except CRICommandTimeOutError:
+            with self.answer_events_lock:
+                self.answer_events.pop(str(msg_id), None)
+                self.error_messages.pop(str(msg_id), None)
+                self.prog_ack_commands.pop(str(msg_id), None)
+            raise
+
+    def delete_program(self) -> bool:
+        """Remove all loaded programs from the controller (not from disk)."""
+        try:
+            return self._command_with_ack("CMD DeleteProgram")[1] is None
+        except (CRICommandTimeOutError, CRIConnectionError):
+            return False
+
+    def add_program_joint(
+        self,
+        command_number: int,
+        joints: Sequence[float],
+        velocity: float,
+        acceleration: float | None = None,
+        smoothing: float | None = None,
+    ) -> str | None:
+        """Append one joint command to the controller program and wait for PROGACK.
+
+        Returns None when acknowledged, otherwise an error text. The acknowledged `cmdCnt`
+        must match the one sent, so a late answer for another command is never accepted.
+        """
+        command = self.build_prog_joint_command(command_number, joints, velocity, acceleration, smoothing)
+        try:
+            msg_id, error = self._command_with_ack(command)
+        except CRICommandTimeOutError:
+            return f"Timed out waiting for PROGACK of program command {command_number}."
+        except CRIConnectionError:
+            return "Connection lost while defining the program."
+        with self.answer_events_lock:
+            acknowledged = self.prog_ack_commands.pop(str(msg_id), None)
+        if error is not None:
+            return f"Controller rejected program command {command_number}: {error}"
+        if acknowledged is not None and acknowledged != command_number:
+            return (f"PROGACK referred to program command {acknowledged}, "
+                    f"expected {command_number}.")
+        return None
+
+    def has_foreign_program_loaded(self) -> bool:
+        """True when the controller holds a program this library did not create."""
+        if self._temporary_program_loaded:
+            return False
+        with self.robot_state_lock:
+            name = str(self.robot_state.main_main_program or "").strip()
+            count = int(self.robot_state.main_commands_count or 0)
+        return count > 0 or name.lower() not in ("", "-", "none", "null")
+
+    def is_program_running(self) -> bool:
+        with self.robot_state_lock:
+            return self.robot_state.main_runstate == RunState.RUNNING
+
+    def request_program_stop(self) -> bool:
+        """Ask the controller to stop the running program (safe to call from any thread)."""
+        try:
+            return self._command_with_ack("CMD StopProgram")[1] is None
+        except (CRICommandTimeOutError, CRIConnectionError):
+            return False
+
+    def run_joint_program(
+        self,
+        waypoints: Sequence[Sequence[float]],
+        velocity: float,
+        acceleration: float,
+        smoothing: float,
+        *,
+        replace_loaded_program: bool = False,
+        stop_event: threading.Event | None = None,
+        timeout: float = 600.0,
+    ) -> ProgramOutcome:
+        """Define a temporary program of smoothed joint moves, start it once and wait for it to end.
+
+        Every waypoint becomes one `PROG JOINT` line; the controller then runs the whole program
+        itself and blends the moves according to `SM`, so no move is replaced by a following one.
+        Success means EXECEND with reason PLAN. A program that was already loaded on the
+        controller is only replaced when `replace_loaded_program` is True.
+        """
+        if not self.connected:
+            return ProgramOutcome(False, "DISCONNECTED", "Robot not connected.")
+        if not waypoints:
+            return ProgramOutcome(False, "INVALID", "Empty path.")
+        if self.is_program_running():
+            return ProgramOutcome(False, "BUSY", "A robot program is already running.")
+        if self.has_foreign_program_loaded() and not replace_loaded_program:
+            return ProgramOutcome(
+                False, "PROGRAM_LOADED",
+                "The controller has a program loaded. Replacing it needs explicit permission.",
+            )
+        try:
+            commands = [
+                self.build_prog_joint_command(i + 1, point, velocity, acceleration, smoothing)
+                for i, point in enumerate(waypoints)
+            ]
+        except ValueError as error:
+            return ProgramOutcome(False, "INVALID", str(error))
+
+        def cancelled() -> bool:
+            return stop_event is not None and stop_event.is_set()
+
+        try:
+            if not self.delete_program():
+                return ProgramOutcome(False, "REJECTED", "The controller did not accept DeleteProgram.")
+            self._temporary_program_loaded = True
+            for index, point in enumerate(waypoints):
+                if cancelled():
+                    self._discard_temporary_program()
+                    return ProgramOutcome(False, "USER", "Execution stopped by user.")
+                error = self.add_program_joint(index + 1, point, velocity, acceleration, smoothing)
+                if error is not None:
+                    self._discard_temporary_program()
+                    return ProgramOutcome(False, "REJECTED", error)
+
+            if cancelled():
+                self._discard_temporary_program()
+                return ProgramOutcome(False, "USER", "Execution stopped by user.")
+
+            self.program_execution.arm()
+            try:
+                _, error = self._command_with_ack("CMD StartProgram")
+            except (CRICommandTimeOutError, CRIConnectionError):
+                error = "StartProgram was not acknowledged."
+            if error is not None:
+                self.program_execution.disarm()
+                self._discard_temporary_program()
+                return ProgramOutcome(False, "REJECTED", f"Program start rejected: {error}")
+
+            stop_sent = False
+
+            def abort_reason() -> str | None:
+                nonlocal stop_sent
+                if not self.connected:
+                    return "DISCONNECTED"
+                if cancelled() and not stop_sent:
+                    stop_sent = True
+                    self.request_program_stop()
+                    return "USER"
+                return None
+
+            outcome = self.program_execution.wait(timeout, abort_reason)
+            if outcome.reason == "TIMEOUT" and self.connected:
+                self.request_program_stop()
+            elif outcome.reason == "DISCONNECTED":
+                outcome = ProgramOutcome(False, "DISCONNECTED", "Robot disconnected during execution!",
+                                         outcome.last_command)
+            elif outcome.reason == "USER" and not outcome.message:
+                outcome = ProgramOutcome(False, "USER", "Execution stopped by user.", outcome.last_command)
+            return outcome
+        except CRIConnectionError:
+            return ProgramOutcome(False, "DISCONNECTED", "Connection lost during execution.")
+        finally:
+            self.program_execution.disarm()
+            if self.connected and not self.is_program_running():
+                self._discard_temporary_program()
+
+    def _discard_temporary_program(self) -> None:
+        """Remove the program this library created; never touches a foreign program."""
+        if not self._temporary_program_loaded:
+            return
+        self._temporary_program_loaded = False
+        self.delete_program()
 
     def pause_programm(self) -> bool:
         """Pause currently running Program

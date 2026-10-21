@@ -1,0 +1,431 @@
+{
+  "schema_version": 1,
+  "file_path": "identification_data\\identification_ID_NORMAL_005_trajectory_export_RUN_05_20261019T221637.csv",
+  "summary_path": "identification_data\\identification_ID_NORMAL_005_trajectory_export_RUN_05_20261019T221637.csv.json",
+  "start_timestamp_utc": "2026-10-19T15:16:37.427700+00:00",
+  "end_timestamp_utc": "2026-10-19T15:16:54.819719+00:00",
+  "first_receive_timestamp_s": 389440.766976,
+  "last_receive_timestamp_s": 389458.0237634,
+  "duration_s": 17.25678739999421,
+  "row_count": 635,
+  "metadata": {
+    "experiment_id": "ID_NORMAL_005",
+    "trajectory_id": "trajectory_export",
+    "run_id": "RUN_05",
+    "commanded_speed": "50.0",
+    "payload_g": "0.0",
+    "contact_label": "NORMAL",
+    "grasp_context": "NONE",
+    "thermal_condition": "COLD"
+  },
+  "units": {
+    "timestamp": "seconds from host monotonic clock at CRI STATUS reception",
+    "sample_index": "zero-based receive-callback sample sequence",
+    "q1..q6": "degrees (raw CRI STATUS POSJOINTCURRENT)",
+    "qdot1..q6": "deg/s (derived using measured timestamp delta)",
+    "current1..current6": "mA (raw CRI STATUS CURRENTJOINTS)",
+    "qddot1..qddot6": "deg/s^2 (candidate derived signal)"
+  },
+  "signal_provenance": {
+    "timestamp": "host perf_counter at the end of the TCP recv() that completed the STATUS frame; frames of one read share it (see timing_class); CRI STATUS carries no device timestamp",
+    "timing_columns": "connection_epoch, frame_counter, rx_chunk_id, frame_in_chunk, frames_in_chunk, t_frame_s (parse-order time, not acquisition time), timing_class",
+    "q": "raw CRI STATUS POSJOINTCURRENT",
+    "current": "raw CRI STATUS CURRENTJOINTS",
+    "qdot": "derived from consecutive q samples using measured timestamp delta",
+    "qddot": "candidate derived signal; unavailable until sufficient samples exist"
+  },
+  "writer_dropped_sample_count": 0,
+  "logger_accounting": {
+    "samples_offered_to_logger": 635,
+    "samples_with_complete_q": 635,
+    "samples_with_complete_current": 635,
+    "rows_written": 635,
+    "dropped_by_queue_or_writer": 0
+  },
+  "frame_accounting": {
+    "start": {
+      "connection_epoch": 1,
+      "frames_total": 7675,
+      "status_frames": 5785,
+      "frame_type_counts": {
+        "CMD": 5,
+        "MESSAGE": 5,
+        "STATUS": 5785,
+        "OPINFO": 58,
+        "VARIABLES": 290,
+        "LOGMSG": 140,
+        "RUNSTATE": 828,
+        "GRIPPERSTATE": 276,
+        "CYCLESTAT": 275,
+        "CMDACK": 11,
+        "EXECACK": 1,
+        "EXECEND": 1
+      },
+      "discarded_frames": 0,
+      "parse_errors": 0,
+      "status_callbacks": 5782,
+      "status_callback_errors": 0
+    },
+    "end": {
+      "connection_epoch": 1,
+      "frames_total": 8589,
+      "status_frames": 6420,
+      "frame_type_counts": {
+        "CMD": 5,
+        "MESSAGE": 5,
+        "STATUS": 6420,
+        "OPINFO": 64,
+        "VARIABLES": 321,
+        "LOGMSG": 176,
+        "RUNSTATE": 918,
+        "GRIPPERSTATE": 306,
+        "CYCLESTAT": 306,
+        "CMDACK": 38,
+        "EXECACK": 28,
+        "EXECEND": 2
+      },
+      "discarded_frames": 0,
+      "parse_errors": 0,
+      "status_callbacks": 6417,
+      "status_callback_errors": 0
+    }
+  },
+  "validity_accounting": {
+    "position": {
+      "FRESH": 635,
+      "MISSING": 0,
+      "NON_FINITE": 0,
+      "UNKNOWN": 0
+    },
+    "current": {
+      "FRESH": 635,
+      "MISSING": 0,
+      "NON_FINITE": 0,
+      "UNKNOWN": 0
+    },
+    "note": "FRESH = field present in the same STATUS and finite (measured 0 is FRESH); MISSING/NON_FINITE rows are logged as nan, never as 0"
+  },
+  "live_derivative_policy": {
+    "min_dt_s": 0.01,
+    "rule": "qdot/qddot are NaN (unavailable, not zero) for BATCH_EARLIER rows, dt < min_dt_s, or non-finite inputs; they are derived, never ground truth"
+  },
+  "writer_error": null,
+  "quality_status": "WARNING",
+  "quality_report": {
+    "file_path": "identification_data\\identification_ID_NORMAL_005_trajectory_export_RUN_05_20261019T221637.csv",
+    "total_rows": 635,
+    "duration_s": 17.25678739999421,
+    "first_timestamp": 389440.766976,
+    "last_timestamp": 389458.0237634,
+    "timestamp_monotonic": true,
+    "monotonic": true,
+    "duplicate_timestamp_values": 218,
+    "duplicate_timestamps": 437,
+    "dt_nonpositive_count": 219,
+    "timing_provenance_present": true,
+    "timing_class_counts": {
+      "BATCH_EARLIER": 219,
+      "BATCH_LAST": 218,
+      "UNIQUE": 198
+    },
+    "batched_row_count": 437,
+    "batched_row_fraction": 0.6881889763779527,
+    "usable_timestamp_duplicates": 0,
+    "usable_nonincreasing_dt_count": 0,
+    "dt_negative_count": 0,
+    "invalid_dt_values": 219,
+    "dt_min": 0.0,
+    "dt_median": 0.03811965000932105,
+    "dt_mean": 0.027218907570968783,
+    "dt_max": 0.06349149998277426,
+    "dt_percentiles": {
+      "P1": 0.0,
+      "P5": 0.0,
+      "P95": 0.05480739998165518,
+      "P99": 0.05941869999514893
+    },
+    "approx_sample_rate_hz": {
+      "min": 15.750139786763706,
+      "median": 21.8388294369476,
+      "mean": 40.56536901484476,
+      "max": 2674.511521814871,
+      "interval_count": 415
+    },
+    "large_gap_count": 0,
+    "large_gap_threshold_s_heuristic": 0.19059825004660524,
+    "large_gap_values_s": [],
+    "missing_values": {
+      "qdot1": 236,
+      "qdot2": 236,
+      "qdot3": 236,
+      "qdot4": 236,
+      "qdot5": 236,
+      "qdot6": 236,
+      "qddot1": 253,
+      "qddot2": 253,
+      "qddot3": 253,
+      "qddot4": 253,
+      "qddot5": 253,
+      "qddot6": 253
+    },
+    "non_finite_values": {
+      "qdot1": 236,
+      "qdot2": 236,
+      "qdot3": 236,
+      "qdot4": 236,
+      "qdot5": 236,
+      "qdot6": 236,
+      "qddot1": 253,
+      "qddot2": 253,
+      "qddot3": 253,
+      "qddot4": 253,
+      "qddot5": 253,
+      "qddot6": 253
+    },
+    "invalid_numeric_values": {},
+    "incomplete_current_rows": 0,
+    "current_columns_present": true,
+    "suspicious_all_zero_current_rows": 0,
+    "repeated_current_values": {
+      "current1": {
+        "adjacent_repeat_count": 28,
+        "longest_identical_run": 9
+      },
+      "current2": {
+        "adjacent_repeat_count": 49,
+        "longest_identical_run": 18
+      },
+      "current3": {
+        "adjacent_repeat_count": 24,
+        "longest_identical_run": 3
+      },
+      "current4": {
+        "adjacent_repeat_count": 166,
+        "longest_identical_run": 10
+      },
+      "current5": {
+        "adjacent_repeat_count": 43,
+        "longest_identical_run": 30
+      },
+      "current6": {
+        "adjacent_repeat_count": 179,
+        "longest_identical_run": 9
+      }
+    },
+    "q_ranges": {
+      "q1": {
+        "min": -0.0,
+        "max": 48.01
+      },
+      "q2": {
+        "min": -40.21,
+        "max": -11.45
+      },
+      "q3": {
+        "min": 102.04,
+        "max": 114.99
+      },
+      "q4": {
+        "min": -0.0,
+        "max": -0.0
+      },
+      "q5": {
+        "min": 65.96,
+        "max": 69.55
+      },
+      "q6": {
+        "min": -0.0,
+        "max": -0.0
+      }
+    },
+    "velocity_ranges": {
+      "qdot1": {
+        "min": 0.0,
+        "max": 9.509499983389873
+      },
+      "qdot2": {
+        "min": 0.0,
+        "max": 5.705699990034093
+      },
+      "qdot3": {
+        "min": 0.0,
+        "max": 2.961632054880894
+      },
+      "qdot4": {
+        "min": 0.0,
+        "max": 0.0
+      },
+      "qdot5": {
+        "min": -0.9509499983388184,
+        "max": 0.0
+      },
+      "qdot6": {
+        "min": 0.0,
+        "max": 0.0
+      }
+    },
+    "current_extrema": {
+      "current1": {
+        "min": 0.0,
+        "max": 668.0
+      },
+      "current2": {
+        "min": 0.0,
+        "max": 831.0
+      },
+      "current3": {
+        "min": 0.0,
+        "max": 826.0
+      },
+      "current4": {
+        "min": 39.0,
+        "max": 225.0
+      },
+      "current5": {
+        "min": 0.0,
+        "max": 574.0
+      },
+      "current6": {
+        "min": 33.0,
+        "max": 60.0
+      }
+    },
+    "acceleration_ranges": {
+      "qddot1": {
+        "min": -167.63568800911978,
+        "max": 506.7484955589842
+      },
+      "qddot2": {
+        "min": -101.44824353110167,
+        "max": 307.91305796119127
+      },
+      "qddot3": {
+        "min": -91.69559313043034,
+        "max": 147.89438411632483
+      },
+      "qddot4": {
+        "min": 0.0,
+        "max": 0.0
+      },
+      "qddot5": {
+        "min": -67.1180047737142,
+        "max": 38.639606258003504
+      },
+      "qddot6": {
+        "min": 0.0,
+        "max": 0.0
+      }
+    },
+    "experiment_id_values": [
+      "ID_NORMAL_005"
+    ],
+    "trajectory_id_values": [
+      "trajectory_export"
+    ],
+    "run_id_values": [
+      "RUN_05"
+    ],
+    "metadata_values": {
+      "experiment_id": [
+        "ID_NORMAL_005"
+      ],
+      "trajectory_id": [
+        "trajectory_export"
+      ],
+      "run_id": [
+        "RUN_05"
+      ],
+      "commanded_speed": [
+        "50.0"
+      ],
+      "payload_g": [
+        "0.0"
+      ],
+      "contact_label": [
+        "NORMAL"
+      ],
+      "grasp_context": [
+        "NONE"
+      ],
+      "thermal_condition": [
+        "COLD"
+      ]
+    },
+    "metadata_consistency": {
+      "experiment_id": true,
+      "trajectory_id": true,
+      "run_id": true,
+      "commanded_speed": true,
+      "payload_g": true,
+      "contact_label": true,
+      "grasp_context": true,
+      "thermal_condition": true
+    },
+    "metadata_inconsistent": false,
+    "metadata_missing_rows": {
+      "experiment_id": 0,
+      "trajectory_id": 0,
+      "run_id": 0,
+      "commanded_speed": 0,
+      "payload_g": 0,
+      "contact_label": 0,
+      "grasp_context": 0,
+      "thermal_condition": 0
+    },
+    "sample_index_gap_count": 0,
+    "malformed_row_count": 0,
+    "schema_summary": {
+      "required_columns": [
+        "timestamp",
+        "q1",
+        "q2",
+        "q3",
+        "q4",
+        "q5",
+        "q6",
+        "qdot1",
+        "qdot2",
+        "qdot3",
+        "qdot4",
+        "qdot5",
+        "qdot6",
+        "current1",
+        "current2",
+        "current3",
+        "current4",
+        "current5",
+        "current6",
+        "experiment_id",
+        "trajectory_id",
+        "run_id",
+        "commanded_speed",
+        "payload_g",
+        "contact_label",
+        "grasp_context",
+        "thermal_condition"
+      ],
+      "optional_columns": [
+        "qddot1",
+        "qddot2",
+        "qddot3",
+        "qddot4",
+        "qddot5",
+        "qddot6",
+        "sample_index"
+      ],
+      "missing_columns": [],
+      "units": {
+        "timestamp": "seconds from host monotonic clock at CRI STATUS reception",
+        "sample_index": "zero-based receive-callback sample sequence",
+        "q1..q6": "degrees (raw CRI STATUS POSJOINTCURRENT)",
+        "qdot1..q6": "deg/s (derived using measured timestamp delta)",
+        "current1..current6": "mA (raw CRI STATUS CURRENTJOINTS)",
+        "qddot1..qddot6": "deg/s^2 (candidate derived signal)"
+      },
+      "notes": "No verified current clipping limit was found; extrema are reported and clipping limit is unknown."
+    },
+    "current_limit_verified": false,
+    "current_clipping_limit": "unknown; no verified repository/manufacturer limit configured",
+    "quality_status": "WARNING"
+  }
+}

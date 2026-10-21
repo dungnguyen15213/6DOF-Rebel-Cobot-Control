@@ -1,0 +1,20 @@
+{
+  "run_id": "identification_Stationary_UNSPECIFIED_TRAJECTORY_RUN_04_20261015T154629",
+  "source_file": "identification_data\\identification_Stationary_UNSPECIFIED_TRAJECTORY_RUN_04_20261015T154629.csv",
+  "source_sha256": "981c34b45cf896bc4dbc53f85147fc1f51d1501bbfff548137bc82aea6c32680",
+  "files": [
+    "RUN_AUDIT.json",
+    "RUN_AUDIT.md",
+    "derivative_quality_plot.png",
+    "joint_current_plot.png",
+    "joint_position_plot.png",
+    "processed_dataset.csv",
+    "processed_dataset.csv.provenance.json",
+    "timing_diagnostics.csv"
+  ],
+  "plots": [
+    "joint_position_plot.png",
+    "joint_current_plot.png",
+    "derivative_quality_plot.png"
+  ]
+}
